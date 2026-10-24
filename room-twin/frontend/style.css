@@ -126,7 +126,7 @@ button.wide { width: 100%; padding: 8px; }
   background: var(--ink); color: var(--bg); font-size: 11px; padding: 3px 8px; border-radius: 10px;
 }
 .tips {
-  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); max-width: calc(100% - 24px);
+  position: absolute; left: 50%; bottom: 64px; transform: translateX(-50%); max-width: calc(100% - 24px);
   background: color-mix(in srgb, var(--panel) 92%, transparent); border: 1px solid var(--line);
   border-radius: 16px; padding: 4px 12px; color: var(--muted); font-size: 12px; pointer-events: none; text-align: center;
 }
@@ -163,3 +163,25 @@ button.wide { width: 100%; padding: 8px; }
 .phone-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .phone-info a { overflow-wrap: anywhere; }
 .warn { color: var(--muted); margin: 0; }
+
+/* ---- AI assistant ---- */
+.ai-bar {
+  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); width: min(640px, calc(100% - 24px));
+  display: flex; gap: 6px; align-items: center; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 24px; padding: 5px 5px 5px 12px; box-shadow: 0 4px 16px rgba(0, 0, 0, .12);
+}
+.ai-bar input { border: 0; background: transparent; flex: 1; padding: 6px 2px; min-width: 0; }
+.ai-bar input:focus { outline: none; }
+.ai-bar button { border-radius: 18px; padding: 6px 16px; }
+.ai-bar.busy { opacity: .7; }
+.ai-icon { font-size: 15px; }
+.ai-reply {
+  position: absolute; left: 50%; bottom: 100px; transform: translateX(-50%); max-width: min(560px, calc(100% - 24px));
+  background: var(--ink); color: var(--bg); padding: 7px 12px; border-radius: 12px; font-size: 13px;
+}
+.ai-reply small { opacity: .65; display: block; margin-top: 2px; font-size: 11px; }
+.model-results { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-height: 260px; overflow-y: auto; }
+.model-results button { padding: 3px; display: flex; flex-direction: column; gap: 2px; font-size: 10px; line-height: 1.2; }
+.model-results img { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: 4px; background: var(--bg); }
+.credit { font-size: 11px; color: var(--muted); }
+.credit a { color: inherit; }

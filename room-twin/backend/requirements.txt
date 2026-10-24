@@ -4,10 +4,14 @@ uvicorn>=0.29
 python-multipart>=0.0.9
 pillow>=10.0
 numpy>=1.26
+anthropic>=2.0     # AI assistant ("a vase here"); needs ANTHROPIC_API_KEY, works in simple mode without
 
 # Recommended: ungated Grounding DINO + SAM segmentation (works on CPU)
 # torch>=2.4
 # transformers>=4.45
+
+# Optional: draw-anything fallback for the assistant (text -> picture -> cut-out / SAM 3D)
+# diffusers>=0.30
 
 # Optional: SAM 3 / SAM 3D Objects (GPU strongly recommended). See README.
 #   SAM 3            -> https://github.com/facebookresearch/sam3

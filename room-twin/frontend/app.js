@@ -93,7 +93,7 @@ function updateOverlays() {
   if (selBox.visible) {
     selBox.setFromObject(n);
     const b = new THREE.Box3().setFromObject(n);
-    const s = o.size ? o.size.map((v, i) => v * (o.scale?.[i] ?? 1)) : b.getSize(new THREE.Vector3()).toArray();
+    const s = o.size?.every((v) => v > 0) ? scaledSize(o) : b.getSize(new THREE.Vector3()).toArray();
     const top = new THREE.Vector3((b.min.x + b.max.x) / 2, b.max.y + 0.05, (b.min.z + b.max.z) / 2).project(camera);
     const visible = top.z < 1 && Math.abs(top.x) < 1 && Math.abs(top.y) < 1;
     label.classList.toggle('hidden', !visible || !!drag?.moved);
@@ -237,12 +237,14 @@ const gltfLoader = new GLTFLoader();
 const plyLoader = new PLYLoader();
 
 function fitInto(inner, size) {
-  // scale a loaded model uniformly into the estimated box, stand it on the floor
+  // scale a loaded model uniformly to fit the given box (null dims are unconstrained; a flat
+  // depth <= 6 cm is ignored), then stand it on the floor
   const box = new THREE.Box3().setFromObject(inner);
   const s = box.getSize(new THREE.Vector3());
   if (size) {
-    const k = Math.min(size[0] / (s.x || 1), size[1] / (s.y || 1), (size[2] > 0.06 ? size[2] / (s.z || 1) : Infinity));
-    inner.scale.multiplyScalar(isFinite(k) ? k : 1);
+    const ratios = [[size[0], s.x], [size[1], s.y], [size[2] > 0.06 ? size[2] : null, s.z]]
+      .filter(([want, have]) => want > 0 && have > 1e-6).map(([want, have]) => want / have);
+    if (ratios.length) inner.scale.multiplyScalar(Math.min(...ratios));
   }
   const b2 = new THREE.Box3().setFromObject(inner);
   const c = b2.getCenter(new THREE.Vector3());
@@ -283,8 +285,7 @@ function buildNode(o) {
     inner.scale.set(o.size[0] / def.size[0], o.size[1] / def.size[1], o.size[2] / def.size[2]);
   } else if (o.kind === 'mesh' || o.kind === 'pointcloud') {
     inner = new THREE.Group();
-    const placeholder = buildCutout({ ...o, cutout: o.cutout || '' });
-    if (o.cutout) inner.add(placeholder);
+    if (o.cutout && o.size?.every((v) => v > 0)) inner.add(buildCutout(o)); // photo card until the model loads
     const onLoad = (obj) => {
       inner.clear();
       const holder = new THREE.Group();
@@ -295,7 +296,16 @@ function buildNode(o) {
       wrap.add(holder);
       fitInto(wrap, o.size);
       inner.add(wrap);
-      obj.traverse((c) => { if (c.isMesh) c.castShadow = c.receiveShadow = true; });
+      obj.traverse((c) => {
+        if (!c.isMesh) return;
+        c.castShadow = c.receiveShadow = true;
+        if (o.color) c.material = [].concat(c.material).map((m) => { const t = m.clone(); t.color?.set(o.color); return t; })[0];
+      });
+      // record the model's real size once, so resizing and the size label work in metres
+      if (!o.size || o.size.some((v) => !(v > 0))) {
+        o.size = new THREE.Box3().setFromObject(wrap).getSize(new THREE.Vector3()).toArray().map((v) => +v.toFixed(3));
+        if (selected === o.id) fillInspector();
+      }
     };
     if (o.kind === 'mesh') gltfLoader.load(o.asset, (gl) => onLoad(gl.scene), undefined, () => toast(`Could not load ${o.label}`));
     else plyLoader.load(o.asset, (geo) => onLoad(new THREE.Points(geo, new THREE.PointsMaterial({ size: 0.012, vertexColors: true }))));
@@ -426,16 +436,25 @@ function fillInspector() {
   [$('iX').value, $('iY').value, $('iZ').value] = o.position.map((v) => (+v).toFixed(2));
   $('iRot').value = Math.round(deg(o.rotationY || 0));
   $('iScale').value = o.scale[0];
+  const dims = scaledSize(o);
+  [$('iW').value, $('iH').value, $('iD').value] = dims.map((v) => (v > 0 ? v.toFixed(2) : ''));
   $('iColor').value = o.color || (o.kind === 'primitive' ? LIBRARY[o.type]?.color : '#ffffff') || '#ffffff';
   $('iLock').checked = !!o.locked;
   $('iHide').checked = !!o.hidden;
-  for (const id of ['iX', 'iY', 'iZ', 'iRot', 'iScale', 'iRotL', 'iRotR', 'iDrop']) $(id).disabled = !!o.locked;
+  for (const id of ['iX', 'iY', 'iZ', 'iRot', 'iScale', 'iRotL', 'iRotR', 'iDrop', 'iW', 'iD', 'iH']) $(id).disabled = !!o.locked;
   const src = $('iSource');
   src.innerHTML = '';
   const info = document.createElement('div');
   info.className = 'muted';
-  info.textContent = `${o.kind}${o.score ? ` · score ${o.score}` : ''}${o.source?.view ? ` · from ${o.source.view}` : ''} · ${o.size.map((v) => v.toFixed(2)).join(' × ')} m`;
+  info.textContent = `${o.kind}${o.score ? ` · score ${o.score}` : ''}${o.source?.view ? ` · from ${o.source.view}` : ''} · ${scaledSize(o).map((v) => v.toFixed(2)).join(' × ')} m`;
   src.appendChild(info);
+  if (o.license) {
+    const credit = document.createElement('div');
+    credit.className = 'credit';
+    credit.textContent = `Model: ${o.license} `;
+    if (o.creditUrl) credit.append(Object.assign(document.createElement('a'), { href: o.creditUrl, target: '_blank', rel: 'noreferrer', textContent: 'source' }));
+    src.appendChild(credit);
+  }
   if (o.cutout) {
     const img = document.createElement('img');
     img.src = o.cutout;
@@ -589,9 +608,23 @@ function keepInRoom(n, snapToWall = true) {
   }
 }
 
+// "here" for the AI: a click (not a drag) on empty floor drops a marker
+const hereMarker = new THREE.Mesh(new THREE.RingGeometry(0.12, 0.17, 32),
+  new THREE.MeshBasicMaterial({ color: 0xe0784d, side: THREE.DoubleSide, depthWrite: false }));
+hereMarker.rotation.x = -Math.PI / 2;
+hereMarker.visible = false;
+scene.add(hereMarker);
+let aiHere = null, downAt = null;
+function setHere(p) {
+  aiHere = p ? [+p.x.toFixed(2), +p.z.toFixed(2)] : null;
+  hereMarker.visible = !!p;
+  if (p) hereMarker.position.set(p.x, 0.01, p.z);
+}
+
 renderer.domElement.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || transform.axis) return; // gizmo has priority
   const id = pickObject(e);
+  downAt = id ? null : { x: e.clientX, y: e.clientY };
   select(id);
   const o = id && byId(id);
   if (!o || o.locked) return;
@@ -633,7 +666,13 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   n.position.z = p.z;
   keepInRoom(n, !e.altKey);
 });
-renderer.domElement.addEventListener('pointerup', () => {
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (downAt && project && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) < 5) {
+    const p = floorPoint(e);
+    const r = roomBox();
+    if (p && p.x > r.x0 && p.x < r.x1 && p.z > r.z0 && p.z < r.z1) setHere(p);
+  }
+  downAt = null;
   if (!drag) return;
   if (drag.moved) { syncFromNode(drag.id); fillInspector(); markDirty(); }
   drag = null;
@@ -953,7 +992,8 @@ addEventListener('keydown', (e) => {
   else if (k === 't') setView('top');
   else if (k === 'p') setView('pers');
   else if (k === 'v') setView('eye');
-  else if (k === 'escape') { toggleHelp(false); select(null); }
+  else if (k === 'escape') { toggleHelp(false); select(null); setHere(null); }
+  else if (e.key === '/' && project) { e.preventDefault(); $('aiInput').focus(); }
   else if ((k === 'delete' || k === 'backspace') && selected) removeObject(selected);
 });
 
@@ -1242,6 +1282,10 @@ async function openProject(id) {
   $('sceneName').disabled = false;
   $('hint').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');
+  $('aiForm').classList.remove('hidden');
+  setHere(null);
+  aiHistory.length = 0;
+  lastChanged = null;
   panoTexture = null;
   if (project.panorama) {
     panoTexture = await texLoader.loadAsync(project.panorama);
@@ -1284,8 +1328,182 @@ async function refreshProjects() {
   }
 }
 
+// ---------------------------------------------------------------- sizes
+// An object's size as shown to the user: its box times its (possibly per-axis) scale.
+function scaledSize(o) {
+  return (o.size || [0, 0, 0]).map((v, i) => (v || 0) * (o.scale?.[i] ?? 1));
+}
+
+// Set an object's size in metres; null keeps that dimension.
+function resizeTo(o, w, h, d) {
+  const cur = scaledSize(o);
+  const want = [w, h, d].map((v, i) => (v > 0 ? v : cur[i]));
+  const base = o.size || want;
+  o.scale = want.map((v, i) => +(v / (base[i] || v || 1)).toFixed(4));
+}
+
+for (const [id, axis] of [['iW', 0], ['iH', 1], ['iD', 2]]) {
+  $(id).addEventListener('focus', checkpoint);
+  $(id).onchange = (e) => {
+    const o = byId(selected);
+    if (!o || !(+e.target.value > 0)) return;
+    const dims = [null, null, null];
+    dims[axis] = +e.target.value;
+    resizeTo(o, ...dims);
+    applyTransform(nodes.get(o.id), o);
+    fillInspector();
+    markDirty();
+  };
+}
+
+// ---------------------------------------------------------------- free model search (Poly Haven, CC0)
+let searchTimer = null;
+$('modelSearch').oninput = (e) => {
+  clearTimeout(searchTimer);
+  const q = e.target.value.trim();
+  if (!q) { $('modelResults').innerHTML = ''; return; }
+  searchTimer = setTimeout(async () => {
+    let hits = [];
+    try { hits = await api(`/api/models?q=${encodeURIComponent(q)}`); } catch { /* offline */ }
+    const box = $('modelResults');
+    box.innerHTML = hits.length ? '' : '<span class="muted small">No matches - try the AI bar, it can find or make anything.</span>';
+    for (const h of hits.slice(0, 12)) {
+      const b = document.createElement('button');
+      b.title = `${h.name} (CC0, Poly Haven)`;
+      b.append(Object.assign(document.createElement('img'), { src: h.thumb, alt: '', loading: 'lazy' }), h.name);
+      b.onclick = () => addCatalogModel(h);
+      box.appendChild(b);
+    }
+  }, 250);
+};
+
+async function addCatalogModel(h) {
+  if (!project) return toast('Open or build a room first');
+  toast(`Fetching ${h.name}…`, 20000);
+  try {
+    const info = await api(`/api/models/${encodeURIComponent(h.id)}`, { method: 'POST' });
+    const p = aiHere ? new THREE.Vector3(aiHere[0], 0, aiHere[1]) : freeSpot(spawnPoint(), 0.8, 0.8);
+    addObject({ id: newId(), label: h.name, kind: 'mesh', asset: info.asset, size: null, license: info.license,
+      position: [p.x, 0, p.z], rotationY: faceRoomCentre(p.x, p.z), scale: [1, 1, 1], mount: 'floor' });
+    toast(`Added ${h.name}`);
+  } catch (err) { toast(`Couldn't fetch that model: ${err.message}`); }
+}
+
+function faceRoomCentre(x, z) {
+  const { cx, cz } = roomBox();
+  return Math.atan2(cx - x, cz - z);
+}
+
+// ---------------------------------------------------------------- AI assistant
+const aiHistory = [];
+let lastChanged = null;
+
+function aiScene() {
+  const r = roomBox();
+  const round = (v) => +(+v).toFixed(2);
+  const view = spawnPoint();
+  return {
+    room: { x_min: round(r.x0), x_max: round(r.x1), z_min: round(r.z0), z_max: round(r.z1), height: project.room.height },
+    objects: project.objects.filter((o) => !o.hidden).slice(-150).map((o) => ({
+      id: o.id, label: o.label, position: o.position.map(round), size: scaledSize(o).map(round),
+      rotation_deg: Math.round(deg(o.rotationY || 0)), mount: o.mount, variant: o.variant || 0 })),
+    selected, last_changed: lastChanged, here: aiHere, view_center: [round(view.x), round(view.z)],
+  };
+}
+
+function objectFromAction(a) {
+  const dims = [a.width, a.height, a.depth].map((v) => (v > 0 ? v : null));
+  let o;
+  if (a.item) { // generated: a cut-out (or SAM 3D mesh) made from a drawn picture
+    o = { ...a.item };
+    if (dims[1]) { const k = dims[1] / o.size[1]; o.size = o.size.map((v) => +(v * k).toFixed(3)); }
+  } else if (a.asset) {
+    o = { kind: 'mesh', asset: a.asset, size: dims.some((v) => v) ? dims : null };
+  } else {
+    const type = LIBRARY[a.library_type] ? a.library_type : 'box';
+    const def = LIBRARY[type];
+    o = { kind: 'primitive', type, color: a.color || def.color, size: dims.map((v, i) => v || def.size[i]) };
+  }
+  return { ...o, id: newId(), label: a.label || o.label || 'object', license: a.license, creditUrl: a.credit_url,
+    variant: a.variant || 0, color: a.color || o.color, scale: [1, 1, 1],
+    position: [a.x, a.elevation > 0 ? a.elevation : 0, a.z],
+    rotationY: a.rotation_deg != null ? rad(a.rotation_deg) : faceRoomCentre(a.x, a.z),
+    mount: a.elevation > 1.2 ? 'wall' : 'floor' };
+}
+
+function applyActions(actions) {
+  if (!actions.length) return;
+  checkpoint();
+  const added = [];
+  for (const a of actions) {
+    const o = a.id && byId(a.id);
+    if (a.op === 'add_object') {
+      const n = objectFromAction(a);
+      project.objects.push(n);
+      added.push(n.id);
+      lastChanged = n.id;
+      continue;
+    }
+    if (!o) continue;
+    lastChanged = o.id;
+    if (a.op === 'resize_object') resizeTo(o, a.width, a.height, a.depth);
+    else if (a.op === 'move_object') o.position = [a.x, a.elevation != null ? a.elevation : o.position[1], a.z];
+    else if (a.op === 'rotate_object') o.rotationY = rad(a.rotation_deg);
+    else if (a.op === 'recolor_object') o.color = a.color;
+    else if (a.op === 'delete_object') { project.objects = project.objects.filter((x) => x !== o); lastChanged = null; }
+    else if (a.op === 'replace_model' && (a.asset || a.item)) {
+      const keep = { id: o.id, label: o.label, position: o.position, rotationY: o.rotationY, mount: o.mount };
+      const target = scaledSize(o);
+      const fresh = objectFromAction({ ...a, x: 0, z: 0, label: o.label });
+      Object.keys(o).forEach((k) => delete o[k]);
+      // keep the old height so the swap doesn't jump in size; the model keeps its proportions
+      Object.assign(o, fresh, keep, { size: fresh.kind === 'mesh' ? [null, target[1] || null, null] : fresh.size, scale: [1, 1, 1] });
+    }
+  }
+  rebuildObjects();
+  for (const id of added) { const n = nodes.get(id); if (n && byId(id).mount === 'floor') { keepInRoom(n, false); syncFromNode(id); } }
+  if (lastChanged && nodes.has(lastChanged)) select(lastChanged);
+  markDirty();
+}
+
+function showReply(text, engine) {
+  const el = $('aiReply');
+  el.textContent = text;
+  if (engine) el.appendChild(Object.assign(document.createElement('small'), { textContent: engine }));
+  el.classList.remove('hidden');
+  clearTimeout(el._h);
+  el._h = setTimeout(() => el.classList.add('hidden'), 9000);
+}
+
+$('aiForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const message = $('aiInput').value.trim();
+  if (!message || !project) return;
+  const form = $('aiForm');
+  form.classList.add('busy');
+  $('aiSend').disabled = true;
+  showReply('Thinking…');
+  try {
+    const res = await api(`/api/projects/${project.id}/assistant`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, scene: aiScene(), history: aiHistory.slice(-6) }),
+    });
+    applyActions(res.actions || []);
+    showReply(res.reply, res.engine && !String(res.engine).startsWith('claude') ? res.engine : '');
+    aiHistory.push({ user: message, reply: res.reply });
+    $('aiInput').value = '';
+  } catch (err) {
+    console.error(err);
+    showReply(`Sorry - ${err.message}`);
+  } finally {
+    form.classList.remove('busy');
+    $('aiSend').disabled = false;
+  }
+};
+
 api('/api/capabilities').then((c) => {
   caps = c;
+  if (c.assistant === false) $('aiInput').placeholder = "Ask: 'add a vase here', 'make it 20% bigger' (simple mode: set ANTHROPIC_API_KEY for full AI)";
   if (c.storage === 'temporary') toast('Rooms are not kept on this deployment yet: connect a Vercel Blob store to save them', 8000);
 }).catch(() => {});
 

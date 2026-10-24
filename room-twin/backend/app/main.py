@@ -18,6 +18,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import assistant, catalog, generate
 from .capture import router as capture_router, sanitize_image
 from .pipeline import Models, make_item_from_photo, project_dir, run_pipeline, write_status
 from .storage import DATA_DIR, DEPLOYED, store
@@ -66,7 +67,8 @@ def _save_upload(f: UploadFile, dest_dir: Path, stem: str) -> Path:
 
 @app.get("/api/capabilities")
 def capabilities():
-    return {**Models.info(), "storage": store.kind, "deployed": DEPLOYED, "maxUpload": MAX_UPLOAD}
+    return {**Models.info(), "storage": store.kind, "deployed": DEPLOYED, "maxUpload": MAX_UPLOAD,
+            "assistant": assistant._client() is not None, "generator": generate.available()}
 
 
 @app.post("/api/projects")
@@ -211,6 +213,49 @@ def project_file(pid: str, path: str):
     if not PID_RE.match(pid) or any(s in ("", ".", "..") for s in path.split("/")):
         raise HTTPException(404)
     return store.file(pid, path)
+
+
+@app.get("/library/{path:path}")
+def library_file(path: str):
+    """Shared 3D models (Poly Haven, Objaverse) downloaded for the assistant / model search."""
+    if any(s in ("", ".", "..") for s in path.split("/")):
+        raise HTTPException(404)
+    res = store.file("lib", path)
+    res.headers["Cache-Control"] = "public, max-age=604800"
+    return res
+
+
+@app.get("/api/models")
+def search_models(q: str = ""):
+    """Search the free model catalog (Poly Haven, CC0)."""
+    return catalog.search(q[:100])
+
+
+@app.post("/api/models/{model_id}")
+def get_model(model_id: str):
+    try:
+        return catalog.fetch(model_id)
+    except KeyError:
+        raise HTTPException(404, "unknown model")
+
+
+@app.post("/api/projects/{pid}/assistant")
+def ask_assistant(pid: str, body: dict, x_owner: str | None = Header(None)):
+    """{message, scene, history} -> {reply, actions}; the browser applies the actions."""
+    _owned(pid, x_owner)
+    message = str(body.get("message", ""))[:2000].strip()
+    if not message:
+        raise HTTPException(400, "empty message")
+
+    def make_item(description: str) -> dict:
+        d = project_dir(pid) / "uploads"
+        path = generate.picture(description, d)
+        item = make_item_from_photo(pid, path, description)
+        made = [DATA_DIR / item[k].removeprefix("files/") for k in ("cutout", "asset") if item.get(k)]
+        store.publish(pid, [path, *made])
+        return item
+
+    return assistant.ask(message, body.get("scene") or {}, body.get("history") or [], make_item)
 
 
 app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")

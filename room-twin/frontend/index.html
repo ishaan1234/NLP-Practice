@@ -109,6 +109,12 @@
       </div>
       <div id="dimLabel" class="dim hidden"></div>
       <div id="tips" class="tips hidden"></div>
+      <div id="aiReply" class="ai-reply hidden"></div>
+      <form id="aiForm" class="ai-bar hidden" autocomplete="off">
+        <span class="ai-icon" aria-hidden="true">✨</span>
+        <input id="aiInput" maxlength="500" placeholder="Ask: 'a vase on the table', 'two cats here', 'make the sofa 20 cm wider'" />
+        <button id="aiSend" class="primary" type="submit">Go</button>
+      </form>
       <div id="dropOverlay" class="drop-overlay hidden">Drop a photo to add it as an item</div>
       <div id="help" class="help hidden">
         <h3>Shortcuts</h3>
@@ -125,6 +131,8 @@
           <dt>Ctrl Z, Ctrl Shift Z</dt><dd>Undo, redo</dd>
           <dt>T P V</dt><dd>Top / 3D / eye view</dd>
           <dt>Ctrl V</dt><dd>Paste a photo as a new item</dd>
+          <dt>/</dt><dd>Ask the AI ("a vase here", "make it bigger")</dd>
+          <dt>Click floor</dt><dd>Set "here" for the AI</dd>
         </dl>
         <button id="helpClose">Got it</button>
       </div>
@@ -140,6 +148,8 @@
         </div>
         <input type="text" id="itemPrompt" placeholder="what's in the photo? (optional, e.g. armchair)" />
         <p class="muted small">Tip: drag a library piece onto the floor, or drop / paste (Ctrl+V) any product photo onto the 3D view.</p>
+        <input type="search" id="modelSearch" placeholder="Search free 3D models (vase, armchair, lamp…)" />
+        <div id="modelResults" class="model-results"></div>
       </section>
 
       <section id="inspector" class="hidden">
@@ -157,6 +167,11 @@
             <button id="iRotR" title="Rotate +90° (Shift+])">⟳ 90°</button>
           </div>
         </label>
+        <div class="grid3">
+          <label>W (m)<input type="number" id="iW" step="0.05" min="0.02" /></label>
+          <label>D (m)<input type="number" id="iD" step="0.05" min="0.02" /></label>
+          <label>H (m)<input type="number" id="iH" step="0.05" min="0.02" /></label>
+        </div>
         <label>Scale<input type="range" id="iScale" min="0.2" max="3" step="0.01" /></label>
         <label class="color-row">Colour<input type="color" id="iColor" /></label>
         <div class="row">

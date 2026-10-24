@@ -10,6 +10,7 @@ dependencies = [
     "pillow>=10.0",
     "numpy>=1.26",
     "vercel-blob>=0.5.0",
+    "anthropic>=2.0",  # the AI assistant (set ANTHROPIC_API_KEY in the project's environment)
 ]
 
 [tool.vercel]
