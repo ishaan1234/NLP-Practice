@@ -107,6 +107,10 @@
         </ol>
         <p class="muted">No photos handy? <a href="#" id="hintBlank">Start with a blank room</a>.</p>
       </div>
+      <div id="layoutSuggestion" class="layout-suggestion hidden" role="region" aria-label="Layout suggestion">
+        <b>Smart Room Layout</b><p id="layoutMessage" role="status" aria-live="polite"></p>
+        <div class="row"><button id="layoutApply" class="primary hidden">Apply layout</button><button id="layoutCancel">Cancel</button></div>
+      </div>
       <div id="dimLabel" class="dim hidden"></div>
       <div id="tips" class="tips hidden"></div>
       <div id="aiReply" class="ai-reply hidden"></div>
@@ -189,6 +193,7 @@
 
       <section id="roomPanel" class="hidden">
         <h2>Room</h2>
+        <button id="optimizeRoom" class="primary wide" disabled>Optimize My Room</button>
         <div class="grid3">
           <label>W<input type="number" id="rW" step="0.1" /></label>
           <label>D<input type="number" id="rD" step="0.1" /></label>
