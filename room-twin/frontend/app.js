@@ -1,0 +1,1061 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { LIBRARY } from './furniture.js';
+
+THREE.Cache.enabled = true;
+const $ = (id) => document.getElementById(id);
+const api = (path, opts) => fetch(path, opts).then(async (r) => {
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  return r.json();
+});
+const deg = THREE.MathUtils.radToDeg, rad = THREE.MathUtils.degToRad;
+const SNAP = 0.05;
+
+// ---------------------------------------------------------------- three.js setup
+const viewport = $('viewport');
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+viewport.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+scene.background = new THREE.Color(dark ? 0x15171a : 0xeceae4);
+
+const camera = new THREE.PerspectiveCamera(55, 1, 0.05, 200);
+camera.position.set(5, 6, 7);
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true;
+orbit.target.set(0, 0.8, 0);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8d8475, 1.4));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(3, 7, 4);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 0.5, far: 25 });
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+
+const roomGroup = new THREE.Group();
+const objectsGroup = new THREE.Group();
+scene.add(roomGroup, objectsGroup);
+
+const transform = new TransformControls(camera, renderer.domElement);
+transform.setTranslationSnap(SNAP);
+transform.setRotationSnap(rad(15));
+transform.showY = false;
+scene.add(transform);
+
+const selBox = new THREE.BoxHelper(new THREE.Object3D(), 0x2f9f84);
+const hoverBox = new THREE.BoxHelper(new THREE.Object3D(), 0x999999);
+hoverBox.material.transparent = true;
+hoverBox.material.opacity = 0.6;
+selBox.visible = hoverBox.visible = false;
+scene.add(selBox, hoverBox);
+
+function resize() {
+  const { clientWidth: w, clientHeight: h } = viewport;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / Math.max(1, h);
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(viewport);
+renderer.setAnimationLoop(() => { orbit.update(); updateOverlays(); renderer.render(scene, camera); });
+
+// ---------------------------------------------------------------- state
+let project = null; // scene.json contents
+const nodes = new Map(); // object id -> THREE.Group
+let selected = null;
+let hovered = null;
+const undoStack = [];
+const redoStack = [];
+let saveTimer = null;
+
+function updateOverlays() {
+  const n = selected && nodes.get(selected);
+  const o = n && byId(selected);
+  selBox.visible = !!n && n.visible;
+  const label = $('dimLabel');
+  if (selBox.visible) {
+    selBox.setFromObject(n);
+    const b = new THREE.Box3().setFromObject(n);
+    const s = o.size ? o.size.map((v, i) => v * (o.scale?.[i] ?? 1)) : b.getSize(new THREE.Vector3()).toArray();
+    const top = new THREE.Vector3((b.min.x + b.max.x) / 2, b.max.y + 0.05, (b.min.z + b.max.z) / 2).project(camera);
+    const visible = top.z < 1 && Math.abs(top.x) < 1 && Math.abs(top.y) < 1;
+    label.classList.toggle('hidden', !visible || !!drag?.moved);
+    label.style.left = `${((top.x + 1) / 2) * viewport.clientWidth}px`;
+    label.style.top = `${((1 - top.y) / 2) * viewport.clientHeight}px`;
+    label.textContent = `${o.locked ? '🔒 ' : ''}${o.label} · ${s[0].toFixed(2)} × ${s[2].toFixed(2)} × ${s[1].toFixed(2)} m`;
+  } else label.classList.add('hidden');
+  const h = hovered && hovered !== selected && nodes.get(hovered);
+  hoverBox.visible = !!h && h.visible;
+  if (hoverBox.visible) hoverBox.setFromObject(h);
+}
+
+function updateTips() {
+  const tips = $('tips');
+  tips.classList.toggle('hidden', !project);
+  const o = selected && byId(selected);
+  if (!o) tips.innerHTML = 'Click an object to select it · drag empty space to orbit · drag furniture in from the right · <kbd>?</kbd> shortcuts';
+  else if (o.locked) tips.innerHTML = `<b>${escapeHtml(o.label)}</b> is locked · press <kbd>L</kbd> to unlock`;
+  else tips.innerHTML = 'Drag to move · <kbd>Shift</kbd>+drag rotate · arrows nudge · <kbd>Alt</kbd> no wall snap · <kbd>Del</kbd> delete';
+}
+
+const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function toast(msg, ms = 2500) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.add('hidden'), ms);
+}
+
+function checkpoint() {
+  if (!project) return;
+  undoStack.push(JSON.stringify(project.objects));
+  if (undoStack.length > 60) undoStack.shift();
+  redoStack.length = 0;
+  updateHistoryButtons();
+}
+
+function updateHistoryButtons() {
+  $('undo').disabled = !undoStack.length;
+  $('redo').disabled = !redoStack.length;
+}
+
+function markDirty() {
+  if (!project) return;
+  $('save').textContent = 'Save*';
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(save, 2500);
+}
+
+async function save() {
+  if (!project) return;
+  clearTimeout(saveTimer);
+  project.name = $('sceneName').value || 'Untitled room';
+  await api(`/api/projects/${project.id}/scene`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(project),
+  });
+  $('save').textContent = 'Saved';
+  setTimeout(() => ($('save').textContent = 'Save'), 1200);
+}
+
+// ---------------------------------------------------------------- room
+const panoShader = {
+  vertexShader: `varying vec3 vWorld;
+    void main() { vec4 w = modelMatrix * vec4(position, 1.0); vWorld = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`,
+  fragmentShader: `uniform sampler2D pano; uniform vec3 eye; uniform float panoYaw; varying vec3 vWorld;
+    void main() {
+      vec3 d = normalize(vWorld - eye);
+      // the scene was turned by panoYaw to line the room up with the axes; undo it for the lookup
+      float u = fract((atan(d.x, -d.z) - panoYaw) / 6.28318530718 + 0.5);
+      float v = asin(clamp(d.y, -1.0, 1.0)) / 3.14159265359 + 0.5;
+      gl_FragColor = texture2D(pano, vec2(u, v));
+      #include <colorspace_fragment>
+    }`,
+};
+let panoTexture = null;
+
+// Room box in world coordinates; the capture camera is at the origin, not necessarily the centre.
+function roomBox() {
+  const r = project.room;
+  const [cx, cz] = r.center || [0, 0];
+  return { cx, cz, x0: cx - r.width / 2, x1: cx + r.width / 2, z0: cz - r.depth / 2, z1: cz + r.depth / 2 };
+}
+
+function buildRoom() {
+  roomGroup.clear();
+  if (!project) return;
+  const r = project.room;
+  const usePano = $('photoWalls').checked && panoTexture;
+  const wallMat = usePano
+    ? new THREE.ShaderMaterial({ ...panoShader, side: THREE.BackSide,
+        uniforms: { pano: { value: panoTexture }, eye: { value: new THREE.Vector3(0, r.cameraHeight, 0) },
+          panoYaw: { value: r.panoYaw || 0 } } })
+    : new THREE.MeshStandardMaterial({ color: r.wallColor, side: THREE.BackSide, roughness: 0.95 });
+  const floorMat = usePano ? wallMat : new THREE.MeshStandardMaterial({ color: r.floorColor, side: THREE.BackSide, roughness: 0.9 });
+  const hidden = new THREE.MeshBasicMaterial({ visible: false });
+  // BoxGeometry face order: +x, -x, +y (ceiling), -y (floor), +z, -z. BackSide = dollhouse view.
+  const shell = new THREE.Mesh(new THREE.BoxGeometry(r.width, r.height, r.depth),
+    [wallMat, wallMat, hidden, floorMat, wallMat, wallMat]);
+  const box = roomBox();
+  shell.position.set(box.cx, r.height / 2, box.cz);
+  shell.receiveShadow = true;
+  shell.name = 'room-shell';
+  roomGroup.add(shell);
+  if (usePano) { // the photo material is unlit, so catch shadows on a transparent overlay
+    const catcher = new THREE.Mesh(new THREE.PlaneGeometry(r.width, r.depth), new THREE.ShadowMaterial({ opacity: 0.25 }));
+    catcher.rotation.x = -Math.PI / 2;
+    catcher.position.set(box.cx, 0.002, box.cz);
+    catcher.receiveShadow = true;
+    roomGroup.add(catcher);
+  }
+  const grid = new THREE.GridHelper(Math.max(r.width, r.depth), Math.round(Math.max(r.width, r.depth) * 2), 0x888888, 0x888888);
+  grid.material.opacity = usePano ? 0.0 : 0.12;
+  grid.material.transparent = true;
+  grid.position.set(box.cx, 0.003, box.cz);
+  grid.name = 'grid';
+  roomGroup.add(grid);
+  // capture point marker
+  const marker = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.2, 16), new THREE.MeshBasicMaterial({ color: 0x2f6f5e }));
+  marker.rotation.x = Math.PI;
+  marker.position.set(0, r.cameraHeight, 0);
+  marker.name = 'camera-marker';
+  roomGroup.add(marker);
+  for (const [k, id] of [['width', 'rW'], ['depth', 'rD'], ['height', 'rH']]) $(id).value = r[k];
+  $('rFloor').value = r.floorColor;
+  $('rWall').value = r.wallColor;
+}
+
+// ---------------------------------------------------------------- objects
+const texLoader = new THREE.TextureLoader();
+const gltfLoader = new GLTFLoader();
+const plyLoader = new PLYLoader();
+
+function fitInto(inner, size) {
+  // scale a loaded model uniformly into the estimated box, stand it on the floor
+  const box = new THREE.Box3().setFromObject(inner);
+  const s = box.getSize(new THREE.Vector3());
+  if (size) {
+    const k = Math.min(size[0] / (s.x || 1), size[1] / (s.y || 1), (size[2] > 0.06 ? size[2] / (s.z || 1) : Infinity));
+    inner.scale.multiplyScalar(isFinite(k) ? k : 1);
+  }
+  const b2 = new THREE.Box3().setFromObject(inner);
+  const c = b2.getCenter(new THREE.Vector3());
+  inner.position.sub(new THREE.Vector3(c.x, b2.min.y, c.z));
+}
+
+function buildCutout(o) {
+  const g = new THREE.Group();
+  const tex = texLoader.load(o.cutout);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const [w, h] = o.size;
+  const m = new THREE.MeshStandardMaterial({ map: tex, alphaTest: 0.5, side: THREE.DoubleSide, roughness: 0.9,
+    color: o.color || '#ffffff' });
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(w, h), m);
+  plane.position.y = h / 2;
+  plane.castShadow = true;
+  plane.customDepthMaterial = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map: tex, alphaTest: 0.5 });
+  g.add(plane);
+  // soft footprint so the card reads as an object standing on the floor
+  if (o.mount !== 'wall') {
+    const foot = new THREE.Mesh(new THREE.CircleGeometry(Math.max(w, o.size[2]) * 0.5, 24),
+      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.12, depthWrite: false }));
+    foot.rotation.x = -Math.PI / 2;
+    foot.position.y = 0.004;
+    foot.scale.y = Math.max(0.3, o.size[2] / Math.max(w, o.size[2]));
+    g.add(foot);
+  }
+  return g;
+}
+
+function buildNode(o) {
+  const g = new THREE.Group();
+  g.userData.id = o.id;
+  let inner;
+  if (o.kind === 'primitive') {
+    const def = LIBRARY[o.type] || LIBRARY.box;
+    inner = def.build(o.color || def.color);
+    inner.scale.set(o.size[0] / def.size[0], o.size[1] / def.size[1], o.size[2] / def.size[2]);
+  } else if (o.kind === 'mesh' || o.kind === 'pointcloud') {
+    inner = new THREE.Group();
+    const placeholder = buildCutout({ ...o, cutout: o.cutout || '' });
+    if (o.cutout) inner.add(placeholder);
+    const onLoad = (obj) => {
+      inner.clear();
+      const holder = new THREE.Group();
+      holder.add(obj);
+      holder.rotation.x = rad(o.modelRotX || 0);
+      holder.rotation.y = rad(o.modelRotY || 0);
+      const wrap = new THREE.Group();
+      wrap.add(holder);
+      fitInto(wrap, o.size);
+      inner.add(wrap);
+      obj.traverse((c) => { if (c.isMesh) c.castShadow = c.receiveShadow = true; });
+    };
+    if (o.kind === 'mesh') gltfLoader.load(o.asset, (gl) => onLoad(gl.scene), undefined, () => toast(`Could not load ${o.label}`));
+    else plyLoader.load(o.asset, (geo) => onLoad(new THREE.Points(geo, new THREE.PointsMaterial({ size: 0.012, vertexColors: true }))));
+  } else {
+    inner = buildCutout(o);
+  }
+  g.add(inner);
+  applyTransform(g, o);
+  return g;
+}
+
+function applyTransform(g, o) {
+  g.position.fromArray(o.position);
+  g.rotation.set(0, o.rotationY || 0, 0);
+  g.scale.fromArray(o.scale || [1, 1, 1]);
+  g.visible = !o.hidden;
+}
+
+function rebuildObjects() {
+  transform.detach();
+  objectsGroup.clear();
+  nodes.clear();
+  for (const o of project.objects) {
+    const n = buildNode(o);
+    nodes.set(o.id, n);
+    objectsGroup.add(n);
+  }
+  if (selected && !nodes.has(selected)) selected = null;
+  select(selected);
+  renderOutliner();
+}
+
+function addObject(o, { select: sel = true } = {}) {
+  checkpoint();
+  project.objects.push(o);
+  const n = buildNode(o);
+  nodes.set(o.id, n);
+  objectsGroup.add(n);
+  renderOutliner();
+  if (sel) select(o.id);
+  markDirty();
+}
+
+function removeObject(id) {
+  checkpoint();
+  project.objects = project.objects.filter((o) => o.id !== id);
+  objectsGroup.remove(nodes.get(id));
+  nodes.delete(id);
+  if (selected === id) select(null);
+  renderOutliner();
+  markDirty();
+}
+
+const byId = (id) => project?.objects.find((o) => o.id === id);
+const newId = () => Math.random().toString(16).slice(2, 10);
+
+function syncFromNode(id) {
+  const o = byId(id), n = nodes.get(id);
+  if (!o || !n) return;
+  o.position = n.position.toArray().map((v) => +v.toFixed(3));
+  o.rotationY = +n.rotation.y.toFixed(4);
+  o.scale = n.scale.toArray().map((v) => +v.toFixed(3));
+}
+
+// ---------------------------------------------------------------- selection + inspector
+function select(id) {
+  selected = id;
+  const n = id && nodes.get(id);
+  const o = id && byId(id);
+  if (n && !o.locked && !o.hidden) transform.attach(n); else transform.detach();
+  $('inspector').classList.toggle('hidden', !n);
+  document.querySelectorAll('#outliner li').forEach((li) => li.classList.toggle('active', li.dataset.id === id));
+  if (n) fillInspector();
+  updateTips();
+}
+
+function toggleFlag(id, flag) {
+  const o = byId(id);
+  if (!o) return;
+  checkpoint();
+  o[flag] = !o[flag];
+  applyTransform(nodes.get(id), o);
+  if (id === selected) select(id);
+  renderOutliner();
+  markDirty();
+}
+
+function focusSelected() {
+  const n = selected && nodes.get(selected);
+  if (!n) return;
+  const b = new THREE.Box3().setFromObject(n);
+  const c = b.getCenter(new THREE.Vector3());
+  const r = Math.max(0.6, b.getSize(new THREE.Vector3()).length());
+  const dir = camera.position.clone().sub(orbit.target).normalize();
+  orbit.target.copy(c);
+  camera.position.copy(c).addScaledVector(dir, r * 1.8);
+  orbit.update();
+}
+
+function rotateSelected(deltaDeg) {
+  const o = byId(selected);
+  if (!o || o.locked) return;
+  checkpoint();
+  o.rotationY = rad(Math.round((deg(o.rotationY || 0) + deltaDeg) * 100) / 100);
+  o.rotationY = Math.atan2(Math.sin(o.rotationY), Math.cos(o.rotationY));
+  applyTransform(nodes.get(o.id), o);
+  fillInspector();
+  markDirty();
+}
+
+function nudgeSelected(dx, dz) {
+  const o = byId(selected);
+  if (!o || o.locked) return;
+  checkpoint();
+  const n = nodes.get(o.id);
+  n.position.x += dx;
+  n.position.z += dz;
+  keepInRoom(n, false);
+  syncFromNode(o.id);
+  fillInspector();
+  markDirty();
+}
+
+function fillInspector() {
+  const o = byId(selected);
+  if (!o) return;
+  $('iLabel').value = o.label;
+  [$('iX').value, $('iY').value, $('iZ').value] = o.position.map((v) => (+v).toFixed(2));
+  $('iRot').value = Math.round(deg(o.rotationY || 0));
+  $('iScale').value = o.scale[0];
+  $('iColor').value = o.color || (o.kind === 'primitive' ? LIBRARY[o.type]?.color : '#ffffff') || '#ffffff';
+  $('iLock').checked = !!o.locked;
+  $('iHide').checked = !!o.hidden;
+  for (const id of ['iX', 'iY', 'iZ', 'iRot', 'iScale', 'iRotL', 'iRotR', 'iDrop']) $(id).disabled = !!o.locked;
+  const src = $('iSource');
+  src.innerHTML = '';
+  const info = document.createElement('div');
+  info.className = 'muted';
+  info.textContent = `${o.kind}${o.score ? ` · score ${o.score}` : ''}${o.source?.view ? ` · from ${o.source.view}` : ''} · ${o.size.map((v) => v.toFixed(2)).join(' × ')} m`;
+  src.appendChild(info);
+  if (o.cutout) {
+    const img = document.createElement('img');
+    img.src = o.cutout;
+    src.appendChild(img);
+  }
+  if (o.kind === 'mesh' || o.kind === 'pointcloud') {
+    const b = document.createElement('button');
+    b.textContent = 'Re-orient model (90° X)';
+    b.onclick = () => { checkpoint(); o.modelRotX = ((o.modelRotX || 0) + 90) % 360; refreshNode(o); markDirty(); };
+    src.appendChild(b);
+  }
+}
+
+function refreshNode(o) {
+  const old = nodes.get(o.id);
+  const n = buildNode(o);
+  objectsGroup.remove(old);
+  objectsGroup.add(n);
+  nodes.set(o.id, n);
+  if (selected === o.id) transform.attach(n);
+}
+
+function renderOutliner() {
+  const ul = $('outliner');
+  ul.innerHTML = '';
+  for (const o of project?.objects || []) {
+    const li = document.createElement('li');
+    li.dataset.id = o.id;
+    li.title = `${o.kind} · double-click to focus`;
+    const thumb = o.cutout ? Object.assign(document.createElement('img'), { src: o.cutout, alt: '' })
+      : Object.assign(document.createElement('span'), { textContent: LIBRARY[o.type]?.icon || '🧊' });
+    thumb.className = 'thumb';
+    const name = Object.assign(document.createElement('span'), { className: 'name', textContent: o.label });
+    const eye = Object.assign(document.createElement('button'), {
+      className: `ico${o.hidden ? ' on' : ''}`, textContent: o.hidden ? '🙈' : '👁', title: o.hidden ? 'Show (H)' : 'Hide (H)' });
+    const lock = Object.assign(document.createElement('button'), {
+      className: `ico${o.locked ? ' on' : ''}`, textContent: o.locked ? '🔒' : '🔓', title: o.locked ? 'Unlock (L)' : 'Lock (L)' });
+    eye.onclick = (e) => { e.stopPropagation(); toggleFlag(o.id, 'hidden'); };
+    lock.onclick = (e) => { e.stopPropagation(); toggleFlag(o.id, 'locked'); };
+    li.append(thumb, name, eye, lock);
+    li.onclick = () => select(o.id);
+    li.ondblclick = () => { select(o.id); focusSelected(); };
+    if (o.hidden) li.classList.add('hidden-obj');
+    if (o.id === selected) li.classList.add('active');
+    ul.appendChild(li);
+  }
+  $('objCount').textContent = project ? `(${project.objects.length})` : '';
+}
+
+const onInspector = (fn) => (e) => {
+  const o = byId(selected);
+  if (!o) return;
+  fn(o, e.target.value);
+  applyTransform(nodes.get(o.id), o);
+  markDirty();
+};
+for (const el of ['iX', 'iY', 'iZ', 'iRot', 'iScale', 'iLabel', 'iColor']) $(el).addEventListener('focus', checkpoint);
+$('iX').oninput = onInspector((o, v) => (o.position[0] = +v));
+$('iY').oninput = onInspector((o, v) => (o.position[1] = +v));
+$('iZ').oninput = onInspector((o, v) => (o.position[2] = +v));
+$('iRot').oninput = onInspector((o, v) => (o.rotationY = rad(+v)));
+$('iScale').oninput = onInspector((o, v) => (o.scale = [+v, +v, +v]));
+$('iLabel').oninput = onInspector((o, v) => { o.label = v; renderOutliner(); });
+$('iColor').oninput = (e) => {
+  const o = byId(selected);
+  if (!o) return;
+  o.color = e.target.value;
+  refreshNode(o);
+  markDirty();
+};
+$('iDel').onclick = () => selected && removeObject(selected);
+$('iRotL').onclick = () => rotateSelected(-90);
+$('iRotR').onclick = () => rotateSelected(90);
+$('iLock').onchange = () => selected && toggleFlag(selected, 'locked');
+$('iHide').onchange = () => selected && toggleFlag(selected, 'hidden');
+$('iFocus').onclick = focusSelected;
+$('iDup').onclick = duplicate;
+$('iDrop').onclick = () => {
+  const o = byId(selected);
+  if (!o) return;
+  checkpoint();
+  o.position[1] = 0;
+  applyTransform(nodes.get(o.id), o);
+  fillInspector();
+  markDirty();
+};
+
+function duplicate() {
+  const o = byId(selected);
+  if (!o) return;
+  const copy = structuredClone(o);
+  copy.id = newId();
+  copy.position = [o.position[0] + 0.3, o.position[1], o.position[2] + 0.3];
+  addObject(copy);
+}
+
+transform.addEventListener('dragging-changed', (e) => {
+  orbit.enabled = !e.value;
+  if (e.value) checkpoint();
+  else if (selected) { syncFromNode(selected); fillInspector(); markDirty(); }
+});
+transform.addEventListener('objectChange', () => {
+  if (!selected) return;
+  const n = nodes.get(selected);
+  if (transform.mode === 'scale') { // keep proportions: follow whichever handle is dragged
+    const axis = { X: 'x', Y: 'y', Z: 'z' }[transform.axis] || 'x';
+    n.scale.setScalar(Math.max(0.05, n.scale[axis]));
+  }
+  n.position.y = Math.max(0, n.position.y);
+  if (transform.mode === 'translate') keepInRoom(n, false);
+});
+
+// ---------------------------------------------------------------- picking + drag-on-floor
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let drag = null;
+
+function setNdc(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+}
+
+function pickObject(e) {
+  setNdc(e);
+  const hit = raycaster.intersectObjects(objectsGroup.children.filter((c) => c.visible), true)
+    .find((h) => h.object.visible && !(h.object.material?.opacity < 0.2));
+  let o = hit?.object;
+  while (o && !o.userData.id) o = o.parent;
+  return o?.userData.id || null;
+}
+
+function floorPoint(e, y = 0) {
+  setNdc(e);
+  const p = new THREE.Vector3();
+  return raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -y), p) ? p : null;
+}
+
+const WALL_SNAP = 0.15;
+
+// Keep the object's footprint inside the room; within WALL_SNAP of a wall, pull it flush.
+function keepInRoom(n, snapToWall = true) {
+  if (!project) return;
+  const r = roomBox();
+  const b = new THREE.Box3().setFromObject(n);
+  const s = snapToWall ? WALL_SNAP : 0;
+  for (const [axis, lo, hi] of [['x', r.x0, r.x1], ['z', r.z0, r.z1]]) {
+    if (b.max[axis] - b.min[axis] >= hi - lo) continue; // bigger than the room: leave it be
+    if (b.min[axis] < lo + s) n.position[axis] += lo - b.min[axis];
+    else if (b.max[axis] > hi - s) n.position[axis] += hi - b.max[axis];
+  }
+}
+
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || transform.axis) return; // gizmo has priority
+  const id = pickObject(e);
+  select(id);
+  const o = id && byId(id);
+  if (!o || o.locked) return;
+  const n = nodes.get(id);
+  if (e.shiftKey) {
+    drag = { id, rotate: true, startX: e.clientX, startRot: n.rotation.y, moved: false };
+  } else {
+    if (transform.mode !== 'translate') return;
+    const p = floorPoint(e, n.position.y);
+    if (!p) return;
+    drag = { id, offset: n.position.clone().sub(p), moved: false };
+  }
+  orbit.enabled = false;
+  renderer.domElement.classList.add('grabbing');
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (!drag) {
+    if (e.buttons) return;
+    const id = project ? pickObject(e) : null;
+    hovered = id;
+    renderer.domElement.classList.toggle('grab', !!id && !byId(id)?.locked);
+    return;
+  }
+  const n = nodes.get(drag.id);
+  if (drag.rotate) {
+    if (!drag.moved) { checkpoint(); drag.moved = true; }
+    let a = drag.startRot + (e.clientX - drag.startX) * 0.012;
+    if ($('snap').checked) a = Math.round(a / rad(15)) * rad(15);
+    n.rotation.y = Math.atan2(Math.sin(a), Math.cos(a));
+    return;
+  }
+  const p = floorPoint(e, n.position.y);
+  if (!p) return;
+  if (!drag.moved) { checkpoint(); drag.moved = true; }
+  p.add(drag.offset);
+  if ($('snap').checked) { p.x = Math.round(p.x / SNAP) * SNAP; p.z = Math.round(p.z / SNAP) * SNAP; }
+  n.position.x = p.x;
+  n.position.z = p.z;
+  keepInRoom(n, !e.altKey);
+});
+renderer.domElement.addEventListener('pointerup', () => {
+  if (!drag) return;
+  if (drag.moved) { syncFromNode(drag.id); fillInspector(); markDirty(); }
+  drag = null;
+  orbit.enabled = true;
+  renderer.domElement.classList.remove('grabbing');
+});
+renderer.domElement.addEventListener('pointerleave', () => { if (!drag) hovered = null; });
+
+// ---------------------------------------------------------------- library + new items
+function spawnPoint() {
+  // on the floor where the camera looks, clamped into the room
+  const p = new THREE.Vector3();
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const r = roomBox();
+  if (!raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p)) p.set(r.cx, 0, r.cz);
+  p.x = THREE.MathUtils.clamp(p.x, r.x0 + 0.5, r.x1 - 0.5);
+  p.z = THREE.MathUtils.clamp(p.z, r.z0 + 0.5, r.z1 - 0.5);
+  return p;
+}
+
+// Nearest spot (spiralling out from p) where a w×d footprint doesn't overlap anything.
+function freeSpot(p, w, d) {
+  const r = roomBox();
+  const taken = [...nodes.values()].filter((n) => n.visible).map((n) => new THREE.Box3().setFromObject(n));
+  const fits = (x, z) => {
+    const b = new THREE.Box3(new THREE.Vector3(x - w / 2, 0.02, z - d / 2), new THREE.Vector3(x + w / 2, 1, z + d / 2));
+    return !taken.some((t) => t.intersectsBox(b));
+  };
+  const clamp = (v, lo, hi, s) => THREE.MathUtils.clamp(v, lo + s / 2, hi - s / 2);
+  for (let ring = 0; ring < 14; ring++) {
+    const steps = Math.max(1, ring * 8);
+    for (let k = 0; k < steps; k++) {
+      const a = (k / steps) * Math.PI * 2;
+      const x = clamp(p.x + Math.cos(a) * ring * 0.3, r.x0, r.x1, w);
+      const z = clamp(p.z + Math.sin(a) * ring * 0.3, r.z0, r.z1, d);
+      if (fits(x, z)) return new THREE.Vector3(x, 0, z);
+    }
+  }
+  return p;
+}
+
+function addPrimitive(type, at) {
+  if (!project) return toast('Open or build a room first');
+  const def = LIBRARY[type];
+  const p = at || freeSpot(spawnPoint(), def.size[0], def.size[2]);
+  const o = { id: newId(), label: type, kind: 'primitive', type, color: def.color, size: [...def.size],
+    position: [p.x, 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: 'floor' };
+  addObject(o);
+  keepInRoom(nodes.get(o.id), false);
+  syncFromNode(o.id);
+}
+
+async function addItemFromFile(file) {
+  if (!project) return toast('Open or build a room first');
+  const fd = new FormData();
+  fd.append('file', file, file.name || 'pasted.png');
+  fd.append('prompt', $('itemPrompt').value);
+  toast('Cutting out the item and building it in 3D…', 60000);
+  try {
+    const item = await api(`/api/projects/${project.id}/items`, { method: 'POST', body: fd });
+    const p = freeSpot(spawnPoint(), item.size[0], item.size[2]);
+    item.position = [p.x, 0, p.z];
+    addObject(item);
+    toast(`Added ${item.label} — drag it into place`);
+  } catch (err) { toast(`Failed: ${err.message}`); }
+}
+
+for (const [type, def] of Object.entries(LIBRARY)) {
+  const b = document.createElement('button');
+  b.innerHTML = `<span>${def.icon}</span>${type}`;
+  b.draggable = true;
+  b.onclick = () => addPrimitive(type);
+  b.ondragstart = (e) => e.dataTransfer.setData('text/room-item', type);
+  $('library').appendChild(b);
+}
+// Viewport accepts library pieces (dropped where the cursor is) and image files.
+const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+let dragDepth = 0;
+viewport.addEventListener('dragenter', (e) => {
+  if (hasFiles(e)) { dragDepth++; $('dropOverlay').classList.remove('hidden'); }
+  $('dropOverlay').textContent = project ? 'Drop a photo to add it as an item' : 'Drop room photos to start a new twin';
+});
+viewport.addEventListener('dragleave', (e) => {
+  if (hasFiles(e) && --dragDepth <= 0) { dragDepth = 0; $('dropOverlay').classList.add('hidden'); }
+});
+viewport.addEventListener('dragover', (e) => e.preventDefault());
+viewport.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  $('dropOverlay').classList.add('hidden');
+  const type = e.dataTransfer.getData('text/room-item');
+  if (type) return addPrimitive(type, floorPoint(e) || undefined);
+  const images = [...e.dataTransfer.files].filter((f) => f.type.startsWith('image/'));
+  if (!images.length) return;
+  if (project) images.forEach(addItemFromFile);
+  else { setFiles(images); toast('Photos added — check directions, then press Build twin'); }
+});
+addEventListener('paste', (e) => {
+  if (e.target.matches?.('input, textarea')) return;
+  const img = [...(e.clipboardData?.files || [])].find((f) => f.type.startsWith('image/'));
+  if (img) { e.preventDefault(); addItemFromFile(img); }
+});
+
+$('itemPhoto').onchange = (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (file) addItemFromFile(file);
+};
+
+$('importGlb').onchange = async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file || !project) return toast('Open or build a room first');
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const { asset, kind } = await api(`/api/projects/${project.id}/assets`, { method: 'POST', body: fd });
+    const p = freeSpot(spawnPoint(), 1, 1);
+    addObject({ id: newId(), label: file.name.replace(/\.\w+$/, ''), kind, asset, size: null,
+      position: [p.x, 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: 'floor' });
+  } catch (err) { toast(`Failed: ${err.message}`); }
+};
+
+// ---------------------------------------------------------------- room panel
+for (const [id, key] of [['rW', 'width'], ['rD', 'depth'], ['rH', 'height']]) {
+  $(id).onchange = (e) => { project.room[key] = Math.max(1, +e.target.value); buildRoom(); markDirty(); };
+}
+$('rFloor').oninput = (e) => { project.room.floorColor = e.target.value; buildRoom(); markDirty(); };
+$('rWall').oninput = (e) => { project.room.wallColor = e.target.value; buildRoom(); markDirty(); };
+$('photoWalls').onchange = buildRoom;
+$('sceneName').onchange = markDirty;
+
+// ---------------------------------------------------------------- toolbar + keys
+function setMode(mode) {
+  transform.setMode(mode);
+  transform.showX = transform.showZ = true;
+  transform.showY = mode !== 'translate';
+  if (mode === 'rotate') { transform.showX = transform.showZ = false; transform.showY = true; }
+  document.querySelectorAll('#modeSeg button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+}
+setMode('translate');
+document.querySelectorAll('#modeSeg button').forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
+$('snap').onchange = (e) => {
+  transform.setTranslationSnap(e.target.checked ? SNAP : null);
+  transform.setRotationSnap(e.target.checked ? rad(15) : null);
+};
+
+function setView(kind) {
+  const r = project?.room || { width: 5, depth: 4, cameraHeight: 1.5 };
+  const { cx, cz } = project ? roomBox() : { cx: 0, cz: 0 };
+  const span = Math.max(r.width, r.depth);
+  if (kind === 'top') { camera.position.set(cx, span * 1.6, cz + 0.001); orbit.target.set(cx, 0, cz); }
+  else if (kind === 'eye') { camera.position.set(0, r.cameraHeight, 0.01); orbit.target.set(0, r.cameraHeight, -0.5); }
+  else { camera.position.set(cx + span * 0.9, span * 1.1, cz + span * 1.2); orbit.target.set(cx, 0.6, cz); }
+  orbit.update();
+}
+$('topView').onclick = () => setView('top');
+$('persView').onclick = () => setView('pers');
+$('eyeView').onclick = () => setView('eye');
+
+function undo() {
+  if (!project || !undoStack.length) return;
+  redoStack.push(JSON.stringify(project.objects));
+  project.objects = JSON.parse(undoStack.pop());
+  rebuildObjects();
+  updateHistoryButtons();
+  markDirty();
+}
+function redo() {
+  if (!project || !redoStack.length) return;
+  undoStack.push(JSON.stringify(project.objects));
+  project.objects = JSON.parse(redoStack.pop());
+  rebuildObjects();
+  updateHistoryButtons();
+  markDirty();
+}
+$('undo').onclick = undo;
+$('redo').onclick = redo;
+
+function screenshot() {
+  const hide = [selBox, hoverBox, transform].filter((o) => o.visible);
+  hide.forEach((o) => (o.visible = false));
+  renderer.render(scene, camera);
+  const a = document.createElement('a');
+  a.href = renderer.domElement.toDataURL('image/png');
+  a.download = `${(project?.name || 'room').replace(/\W+/g, '_')}.png`;
+  a.click();
+  hide.forEach((o) => (o.visible = true));
+}
+$('shot').onclick = screenshot;
+const toggleHelp = (show) => $('help').classList.toggle('hidden', !(show ?? $('help').classList.contains('hidden')));
+$('helpBtn').onclick = () => toggleHelp();
+$('helpClose').onclick = () => toggleHelp(false);
+$('save').onclick = () => save().catch((e) => toast(e.message));
+
+addEventListener('keydown', (e) => {
+  if (e.target.matches('input, select, textarea')) return;
+  const k = e.key.toLowerCase();
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
+  else if (mod && k === 'z') { e.preventDefault(); undo(); }
+  else if (e.key === '?') toggleHelp();
+  else if (k === '[' || k === '{') rotateSelected(e.shiftKey ? -90 : -15);
+  else if (k === ']' || k === '}') rotateSelected(e.shiftKey ? 90 : 15);
+  else if (k.startsWith('arrow') && selected) {
+    e.preventDefault();
+    const step = e.shiftKey ? 0.5 : SNAP;
+    // nudge relative to the camera so "up" always moves away from you
+    const fwd = new THREE.Vector3();
+    camera.getWorldDirection(fwd);
+    fwd.y = 0;
+    if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1);
+    fwd.normalize();
+    const right = new THREE.Vector3(-fwd.z, 0, fwd.x);
+    const v = { arrowup: fwd, arrowdown: fwd.clone().negate(), arrowright: right, arrowleft: right.clone().negate() }[k];
+    // snap the direction to the nearest room axis so nudges stay on the grid
+    const ax = Math.abs(v.x) > Math.abs(v.z) ? [Math.sign(v.x), 0] : [0, Math.sign(v.z)];
+    nudgeSelected(ax[0] * step, ax[1] * step);
+  }
+  else if (k === 'f') focusSelected();
+  else if (k === 'h' && selected) toggleFlag(selected, 'hidden');
+  else if (k === 'l' && selected) toggleFlag(selected, 'locked');
+  else if ((e.ctrlKey || e.metaKey) && k === 's') { e.preventDefault(); save(); }
+  else if ((e.ctrlKey || e.metaKey) && k === 'd') { e.preventDefault(); duplicate(); }
+  else if (k === 'w') setMode('translate');
+  else if (k === 'e') setMode('rotate');
+  else if (k === 'r') setMode('scale');
+  else if (k === 't') setView('top');
+  else if (k === 'p') setView('pers');
+  else if (k === 'v') setView('eye');
+  else if (k === 'escape') { toggleHelp(false); select(null); }
+  else if ((k === 'delete' || k === 'backspace') && selected) removeObject(selected);
+});
+
+$('exportGlb').onclick = () => {
+  if (!project) return;
+  const out = new THREE.Scene();
+  const r = project.room;
+  const { cx, cz } = roomBox();
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(r.width, r.depth), new THREE.MeshStandardMaterial({ color: r.floorColor }));
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.set(cx, 0, cz);
+  floor.name = 'floor';
+  out.add(floor);
+  const wm = new THREE.MeshStandardMaterial({ color: r.wallColor, side: THREE.DoubleSide });
+  for (const [w, x, z, ry] of [[r.width, 0, -r.depth / 2, 0], [r.width, 0, r.depth / 2, Math.PI],
+    [r.depth, -r.width / 2, 0, Math.PI / 2], [r.depth, r.width / 2, 0, -Math.PI / 2]]) {
+    const wall = new THREE.Mesh(new THREE.PlaneGeometry(w, r.height), wm);
+    wall.position.set(cx + x, r.height / 2, cz + z);
+    wall.rotation.y = ry;
+    out.add(wall);
+  }
+  for (const n of objectsGroup.children) {
+    const c = n.clone(true);
+    c.name = byId(n.userData.id)?.label || 'object';
+    out.add(c);
+  }
+  new GLTFExporter().parse(out, (buf) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([buf], { type: 'model/gltf-binary' }));
+    a.download = `${(project.name || 'room').replace(/\W+/g, '_')}.glb`;
+    a.click();
+  }, (err) => toast(`Export failed: ${err}`), { binary: true });
+};
+
+// ---------------------------------------------------------------- projects + upload
+let pending = [];
+
+const DIRECTIONS = [[0, 'ahead'], [45, 'ahead-right'], [90, 'right'], [135, 'behind-right'],
+  [180, 'behind'], [225, 'behind-left'], [270, 'left'], [315, 'ahead-left']];
+
+// Which way each photo faces, relative to the first one; arrow shows it at a glance.
+function directionPicker(p, i) {
+  const wrap = document.createElement('div');
+  wrap.className = 'dir';
+  const arrow = Object.assign(document.createElement('span'), { className: 'arrow', textContent: '↑' });
+  const sel = document.createElement('select');
+  sel.title = 'Which way the camera faced, compared to the first photo';
+  const opts = DIRECTIONS.some(([d]) => d === p.yaw) ? DIRECTIONS : [...DIRECTIONS, [p.yaw, `${p.yaw}°`]];
+  for (const [d, name] of opts.sort((a, b) => a[0] - b[0])) sel.add(new Option(i === 0 && d === 0 ? 'first' : name, d));
+  sel.value = p.yaw;
+  sel.disabled = i === 0;
+  const sync = () => (arrow.style.transform = `rotate(${p.yaw}deg)`);
+  sel.onchange = () => { p.yaw = +sel.value; sync(); };
+  sync();
+  wrap.append(arrow, sel);
+  return wrap;
+}
+
+// Camera tilt per photo: auto-detected from vertical edges unless the user says otherwise.
+function tiltPicker(p) {
+  const sel = document.createElement('select');
+  sel.title = 'How the camera was tilted. Auto works it out from door frames, corners and furniture legs.';
+  for (const [v, name] of [['', 'tilt: auto'], ['0', 'level'], ['-10', 'down 10°'], ['-20', 'down 20°'],
+    ['-30', 'down 30°'], ['10', 'up 10°']]) sel.add(new Option(name, v));
+  sel.value = p.pitch ?? '';
+  sel.onchange = () => (p.pitch = sel.value === '' ? null : +sel.value);
+  const wrap = document.createElement('div');
+  wrap.className = 'dir';
+  wrap.appendChild(sel);
+  return wrap;
+}
+
+async function startBlank(e) {
+  e?.preventDefault();
+  const fd = new FormData();
+  fd.append('room_width', $('roomW').value);
+  fd.append('room_depth', $('roomD').value);
+  try {
+    const { id } = await api('/api/projects/blank', { method: 'POST', body: fd });
+    await openProject(id);
+    refreshProjects();
+    toast('Blank room ready — add furniture from the right panel');
+  } catch (err) { toast(err.message); }
+}
+$('blank').onclick = startBlank;
+$('hintBlank').onclick = startBlank;
+
+function renderThumbs() {
+  const box = $('thumbs');
+  box.innerHTML = '';
+  const multi = $('mode').value !== '360';
+  pending.forEach((p, i) => {
+    const fig = document.createElement('figure');
+    const img = document.createElement('img');
+    img.src = p.url;
+    fig.appendChild(img);
+    if (multi && pending.length > 1) fig.appendChild(directionPicker(p, i));
+    if (multi) fig.appendChild(tiltPicker(p));
+    box.appendChild(fig);
+  });
+  $('build').disabled = !pending.length;
+}
+
+function setFiles(files) {
+  pending.forEach((p) => URL.revokeObjectURL(p.url));
+  const list = [...files].filter((f) => f.type.startsWith('image/'));
+  pending = list.map((f, i) => ({ file: f, url: URL.createObjectURL(f), yaw: Math.round((i * 360) / list.length) }));
+  renderThumbs();
+}
+
+$('files').onchange = (e) => setFiles(e.target.files);
+$('mode').onchange = renderThumbs;
+const drop = $('drop');
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); setFiles(e.dataTransfer.files); };
+
+$('build').onclick = async () => {
+  const fd = new FormData();
+  pending.forEach((p) => fd.append('files', p.file));
+  fd.append('name', pending[0]?.file.name.replace(/\.\w+$/, '') || 'My room');
+  fd.append('mode', $('mode').value);
+  fd.append('yaws', JSON.stringify(pending.map((p) => p.yaw)));
+  fd.append('pitches', JSON.stringify(pending.map((p) => p.pitch ?? null)));
+  if ($('lens').value) fd.append('hfov', $('lens').value);
+  fd.append('camera_height', $('camH').value);
+  fd.append('room_width', $('roomW').value);
+  fd.append('room_depth', $('roomD').value);
+  fd.append('prompts', $('prompts').value);
+  fd.append('reconstruct', $('recon').checked);
+  $('build').disabled = true;
+  try {
+    const { id } = await api('/api/projects', { method: 'POST', body: fd });
+    await poll(id);
+    await openProject(id);
+  } catch (err) { toast(`Build failed: ${err.message}`, 6000); }
+  $('build').disabled = false;
+  refreshProjects();
+};
+
+async function poll(id) {
+  const prog = $('progress');
+  prog.classList.remove('hidden');
+  for (;;) {
+    const s = await api(`/api/projects/${id}/status`);
+    prog.querySelector('.bar').style.width = `${s.progress * 100}%`;
+    prog.querySelector('span').textContent = s.stage;
+    if (s.stage === 'done') break;
+    if (s.stage === 'error') throw new Error(s.error);
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  setTimeout(() => prog.classList.add('hidden'), 1500);
+}
+
+async function openProject(id) {
+  project = await api(`/api/projects/${id}/scene`);
+  undoStack.length = redoStack.length = 0;
+  updateHistoryButtons();
+  selected = hovered = null;
+  $('sceneName').value = project.name || '';
+  $('sceneName').disabled = false;
+  $('hint').classList.add('hidden');
+  $('roomPanel').classList.remove('hidden');
+  panoTexture = null;
+  if (project.panorama) {
+    panoTexture = await texLoader.loadAsync(project.panorama);
+    panoTexture.colorSpace = THREE.SRGBColorSpace;
+    panoTexture.minFilter = THREE.LinearFilter; // no mipmaps -> no seam where u wraps
+    panoTexture.generateMipmaps = false;
+  }
+  $('photoWalls').parentElement.classList.toggle('hidden', !panoTexture);
+  buildRoom();
+  rebuildObjects();
+  setView('pers');
+  const m = project.models || {};
+  $('caps').textContent = project.views?.length
+    ? `segmenter: ${m.segmenter || '?'} · 3D: ${m.reconstructor || 'photo cutouts'}` : 'blank room';
+  updateTips();
+  document.querySelectorAll('#projects li').forEach((li) => li.classList.toggle('active', li.dataset.id === id));
+  history.replaceState(null, '', `#${id}`);
+}
+
+async function refreshProjects() {
+  const ul = $('projects');
+  const list = await api('/api/projects');
+  ul.innerHTML = list.length ? '' : '<li class="muted">No projects yet</li>';
+  for (const p of list) {
+    const li = document.createElement('li');
+    li.dataset.id = p.id;
+    li.innerHTML = '<span></span><span><span class="muted"></span> <button title="Delete">✕</button></span>';
+    li.children[0].textContent = p.name || p.id;
+    li.querySelector('.muted').textContent = p.stage === 'done' ? '' : p.stage;
+    li.onclick = () => (p.stage === 'done' ? openProject(p.id) : poll(p.id).then(() => openProject(p.id)).catch((e) => toast(e.message)));
+    li.querySelector('button').onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete "${p.name}"?`)) return;
+      await api(`/api/projects/${p.id}`, { method: 'DELETE' });
+      if (project?.id === p.id) location.hash = '';
+      refreshProjects();
+    };
+    if (project?.id === p.id) li.classList.add('active');
+    ul.appendChild(li);
+  }
+}
+
+refreshProjects().then(() => {
+  const id = location.hash.slice(1);
+  if (id) openProject(id).catch(() => {});
+});
