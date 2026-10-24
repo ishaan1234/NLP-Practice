@@ -227,6 +227,51 @@ class GroundedSamSegmenter:
         return self._masks(image, b1 + b2, s1 + s2, l1 + l2)
 
 
+class FalSegmenter:
+    """SAM 3 hosted on fal.ai (fal-ai/sam-3/image): one request per prompt, run in parallel.
+
+    $0.005 per prompt per image, so a 360 photo (8 views) with the default prompts is ~$0.90;
+    set ROOM_TWIN_SEGMENTER=grounded-sam to segment for free on your own CPU instead.
+    """
+    name = "sam3 (fal.ai)"
+
+    def __init__(self, score_threshold: float = 0.4):
+        from . import fal_client
+        if not fal_client.configured():
+            raise RuntimeError("FAL_KEY not set")
+        self.fal = fal_client
+        self.score_threshold = score_threshold
+
+    def _one(self, image_uri: str, size: tuple[int, int], prompt: str) -> list[Detection]:
+        import base64
+        import io
+        res = self.fal.run("fal-ai/sam-3/image", {
+            "image_url": image_uri, "prompt": prompt, "return_multiple_masks": True, "max_masks": 8,
+            "include_scores": True, "apply_mask": False, "sync_mode": True, "output_format": "png"})
+        masks, scores = res.get("masks") or [], res.get("scores") or []
+        dets = []
+        for i, m in enumerate(masks):
+            score = float(scores[i]) if i < len(scores) and scores[i] is not None else 0.5
+            if score < self.score_threshold:
+                continue
+            url = m.get("url", "")
+            raw = base64.b64decode(url.split(",", 1)[1]) if url.startswith("data:") else self.fal.download(url)
+            mask = Image.open(io.BytesIO(raw)).convert("L")
+            if mask.size != size:
+                mask = mask.resize(size, Image.NEAREST)
+            arr = np.asarray(mask) > 127
+            if arr.sum() > 50:
+                dets.append(Detection(prompt, arr, score))
+        return dets
+
+    def segment(self, image: Image.Image, prompts: list[str]) -> list[Detection]:
+        from concurrent.futures import ThreadPoolExecutor
+        uri = self.fal.data_uri(image.convert("RGB"), "JPEG")
+        with ThreadPoolExecutor(8) as ex:
+            results = list(ex.map(lambda p: self._one(uri, image.size, p), prompts))
+        return nms([d for r in results for d in r])
+
+
 class RemoteSegmenter:
     """SAM 3 on a remote GPU worker (gpu-worker/, e.g. a Colab A100)."""
     name = "sam3 (remote GPU)"
@@ -252,15 +297,21 @@ def load_segmenter():
     """SAM 3 if installed, else Grounding DINO + SAM, else the colour-region fallback.
 
     With ROOM_TWIN_GPU_URL/ROOM_TWIN_GPU_TOKEN set, a remote GPU worker comes first.
-    ROOM_TWIN_SEGMENTER=sam3|grounded-sam|remote|fallback forces one.
+    With FAL_KEY set, SAM 3 on fal.ai comes before the local CPU models.
+    ROOM_TWIN_SEGMENTER=sam3|grounded-sam|remote|fal|fallback forces one.
     """
     from . import gpu_client
 
     choice = os.environ.get("ROOM_TWIN_SEGMENTER", "auto")
+    from . import fal_client
+
     order = {"sam3": [Sam3Segmenter], "grounded-sam": [GroundedSamSegmenter], "remote": [RemoteSegmenter],
-             "fallback": []}.get(choice, [Sam3Segmenter, GroundedSamSegmenter])
-    if choice == "auto" and gpu_client.configured():
-        order = [RemoteSegmenter, *order]  # a GPU worker was set up on purpose: use it first
+             "fal": [FalSegmenter], "fallback": []}.get(choice, [Sam3Segmenter, GroundedSamSegmenter])
+    if choice == "auto":
+        if fal_client.configured():
+            order = [Sam3Segmenter, FalSegmenter, GroundedSamSegmenter]  # paid but SAM 3 quality
+        if gpu_client.configured():
+            order = [RemoteSegmenter, *order]  # a GPU worker was set up on purpose: use it first
     for cls in order:
         try:
             seg = cls()

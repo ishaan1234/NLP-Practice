@@ -51,6 +51,37 @@ class Sam3DReconstructor:
         return None
 
 
+class FalReconstructor:
+    """SAM 3D Objects hosted on fal.ai (fal-ai/sam-3/3d-objects): $0.02 per object."""
+    name = "sam3d-objects (fal.ai)"
+
+    def __init__(self):
+        from . import fal_client
+        if not fal_client.configured():
+            raise RuntimeError("FAL_KEY not set")
+        self.fal = fal_client
+
+    def reconstruct(self, image: Image.Image, mask: np.ndarray, out_stem: Path) -> tuple[str, Path] | None:
+        res = self.fal.run("fal-ai/sam-3/3d-objects", {
+            "image_url": self.fal.data_uri(image.convert("RGB"), "JPEG"),
+            "mask_urls": [self.fal.data_uri(Image.fromarray(mask.astype(np.uint8) * 255), "PNG")],
+            "export_textured_glb": True, "seed": 42})
+        glb = (res.get("model_glb") or {}).get("url")
+        if glb:
+            path = out_stem.with_suffix(".glb")
+            path.write_bytes(self.fal.download(glb))
+            return "mesh", path
+        splat = (res.get("gaussian_splat") or {}).get("url")
+        if splat:
+            raw = out_stem.with_name(out_stem.name + "_splat.ply")
+            raw.write_bytes(self.fal.download(splat))
+            path = out_stem.with_suffix(".ply")
+            splat_ply_to_points(raw, path)
+            raw.unlink(missing_ok=True)
+            return "pointcloud", path
+        return None
+
+
 class RemoteReconstructor:
     """SAM 3D Objects on a remote GPU worker (gpu-worker/, e.g. a Colab A100)."""
     name = "sam3d-objects (remote GPU)"
@@ -74,6 +105,8 @@ class RemoteReconstructor:
 def load_reconstructor():
     from . import gpu_client
 
+    from . import fal_client
+
     if gpu_client.configured():
         try:
             rec = RemoteReconstructor()
@@ -81,6 +114,9 @@ def load_reconstructor():
             return rec
         except Exception as e:
             log.warning("remote GPU worker unavailable for 3D (%s)", e)
+    if fal_client.configured():
+        log.info("SAM 3D Objects on fal.ai")
+        return FalReconstructor()
     try:
         rec = Sam3DReconstructor()
         log.info("SAM 3D Objects loaded")

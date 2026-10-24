@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Room Twin launcher - one command on Windows, macOS or Linux.
 
-    python launch.py           set up, connect a Colab GPU (real 3D), start the app, open the browser
-    python launch.py --no-gpu  start the app without a GPU worker (photo cut-outs, CPU segmentation)
+    python launch.py           set up, start the app, open the browser. Real 3D + SAM 3 come from
+                               fal.ai (asks once for a FAL_KEY; ~$0.02 per 3D object)
+    python launch.py --colab   use your own Colab GPU instead of fal.ai (needs Hugging Face access
+                               to the gated SAM models; on Windows also WSL)
     python launch.py stop      stop the Colab GPU session (stops using compute units)
-    python launch.py status    show what is configured and whether the GPU worker answers
+    python launch.py status    show what is configured
 
-On Windows the Colab CLI runs inside WSL (Google supports it on Linux/macOS only); install WSL
-once with `wsl --install` in an admin PowerShell. Settings live in .roomtwin.env (not committed).
+Settings live in .roomtwin.env (not committed).
 Only the Python standard library is used here.
 """
 from __future__ import annotations
@@ -197,11 +198,16 @@ def start_gpu(env: dict) -> bool:
 
 
 # ---------------------------------------------------------------- commands
-def up(use_gpu: bool):
+def up(colab: bool):
     env = load_env()
     ensure_venv()
+    if not colab:
+        fal = ask_secret(env, "FAL_KEY", "fal.ai API key for real 3D models + SAM 3 (fal.ai/dashboard/keys; "
+                         "Enter to skip): ", required=False)
+        if not fal:
+            say("no fal.ai key: detected objects stay photo cut-outs (add FAL_KEY to .roomtwin.env later)")
     ask_secret(env, "ANTHROPIC_API_KEY", "Anthropic API key for the AI assistant (Enter to skip): ", required=False)
-    gpu = use_gpu and start_gpu(env)
+    gpu = colab and start_gpu(env)
     app_env = {**os.environ, **{k: v for k, v in env.items() if v}}
     if not gpu:
         app_env.pop("ROOM_TWIN_GPU_URL", None)
@@ -214,7 +220,8 @@ def up(use_gpu: bool):
                         "--host", "0.0.0.0", "--port", str(PORT)], cwd=ROOT, env=app_env)
     except KeyboardInterrupt:
         pass
-    say("app stopped. The Colab GPU keeps running (and using compute units) until: python launch.py stop")
+    if gpu:
+        say("app stopped. The Colab GPU keeps running (and using compute units) until: python launch.py stop")
 
 
 def stop():
@@ -229,7 +236,7 @@ def stop():
 def status():
     env = load_env()
     say(f"settings file: {ENV_FILE} ({'found' if ENV_FILE.exists() else 'not yet'})")
-    for key in ("HF_TOKEN", "ANTHROPIC_API_KEY", "ROOM_TWIN_GPU_TOKEN"):
+    for key in ("FAL_KEY", "ANTHROPIC_API_KEY", "HF_TOKEN", "ROOM_TWIN_GPU_TOKEN"):
         say(f"{key}: {'set' if env.get(key) else 'not set'}")
     url = env.get("ROOM_TWIN_GPU_URL", "")
     say(f"GPU worker: {url or 'none'} - {'answering' if worker_alive(url, env.get('ROOM_TWIN_GPU_TOKEN', '')) else 'not answering'}")
@@ -242,4 +249,4 @@ if __name__ == "__main__":
     elif "status" in args:
         status()
     else:
-        up(use_gpu="--no-gpu" not in args)
+        up(colab="--colab" in args)

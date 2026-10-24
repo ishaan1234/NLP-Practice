@@ -18,7 +18,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import assistant, catalog, generate, gpu_client
+from . import assistant, catalog, fal_client, generate, gpu_client
 from .capture import router as capture_router, sanitize_image
 from .pipeline import Models, make_item_from_photo, project_dir, run_pipeline, write_status
 from .storage import DATA_DIR, DEPLOYED, store
@@ -69,7 +69,8 @@ def _save_upload(f: UploadFile, dest_dir: Path, stem: str) -> Path:
 def capabilities():
     return {**Models.info(), "storage": store.kind, "deployed": DEPLOYED, "maxUpload": MAX_UPLOAD,
             "assistant": assistant._client() is not None, "generator": generate.available(),
-            "gpu": gpu_client.configured(), "make3d": gpu_client.configured() or _local_sam3d()}
+            "gpu": gpu_client.configured(), "fal": fal_client.configured(),
+            "make3d": gpu_client.configured() or fal_client.configured() or _local_sam3d()}
 
 
 def _local_sam3d() -> bool:
