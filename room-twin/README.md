@@ -21,7 +21,27 @@ photos / 360 image ──► views (360 → 8 perspective crops)
                scene.json  ──►  Three.js editor (move, rotate, scale, add, export GLB)
 ```
 
-## Quick start
+## Easiest: the launcher (Windows, macOS, Linux)
+
+```
+git clone https://github.com/ishaan1234/roomroom
+cd roomroom/room-twin
+RoomTwin.bat                 # Windows: or double-click it.  macOS/Linux: python3 launch.py
+```
+
+It sets everything up, asks once for your Hugging Face token (and optionally an Anthropic key for
+the AI assistant), starts a **Colab A100** running SAM 3 + SAM 3D for real 3D models, connects the
+app to it and opens your browser. First run: a Google sign-in link to open and paste back, then
+~20-40 min while Colab installs; later runs reuse it.
+
+- `RoomTwin.bat stop` / `python3 launch.py stop` - stop the Colab GPU (it uses compute units)
+- `RoomTwin.bat --no-gpu` - just the app, no GPU (photo cut-outs, CPU segmentation)
+- `RoomTwin.bat status` - what's configured and whether the GPU answers
+
+Windows needs WSL for the Colab part (Google's Colab CLI is Linux/macOS only): run
+`wsl --install` once in an admin PowerShell and reboot. Python 3.10+ from python.org.
+
+## Quick start (manual)
 
 ```bash
 cd room-twin
