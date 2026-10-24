@@ -4,3 +4,4 @@ data/
 checkpoints/
 sam3/
 sam-3d-objects/
+.roomtwin.env
