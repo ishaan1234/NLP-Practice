@@ -248,10 +248,12 @@ class FalSegmenter:
         res = self.fal.run("fal-ai/sam-3/image", {
             "image_url": image_uri, "prompt": prompt, "return_multiple_masks": True, "max_masks": 8,
             "include_scores": True, "apply_mask": False, "sync_mode": True, "output_format": "png"})
-        masks, scores = res.get("masks") or [], res.get("scores") or []
+        masks = res.get("masks") or []
+        # metadata says which mask each score belongs to; the plain `scores` list is sorted by score
+        scores = {m["index"]: m.get("score") for m in res.get("metadata") or [] if "index" in m}
         dets = []
         for i, m in enumerate(masks):
-            score = float(scores[i]) if i < len(scores) and scores[i] is not None else 0.5
+            score = float(scores[i]) if scores.get(i) is not None else 0.5
             if score < self.score_threshold:
                 continue
             url = m.get("url", "")
@@ -270,6 +272,11 @@ class FalSegmenter:
         with ThreadPoolExecutor(8) as ex:
             results = list(ex.map(lambda p: self._one(uri, image.size, p), prompts))
         return nms([d for r in results for d in r])
+
+    def segment_with_structure(self, image: Image.Image, prompts: list[str],
+                               structure: list[str]) -> list[Detection]:
+        """Every prompt is its own request anyway: furniture and structure in one parallel batch."""
+        return self.segment(image, prompts + structure)
 
 
 class RemoteSegmenter:

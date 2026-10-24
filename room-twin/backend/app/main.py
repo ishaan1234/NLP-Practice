@@ -70,7 +70,9 @@ def capabilities():
     return {**Models.info(), "storage": store.kind, "deployed": DEPLOYED, "maxUpload": MAX_UPLOAD,
             "assistant": assistant._client() is not None, "generator": generate.available(),
             "gpu": gpu_client.configured(), "fal": fal_client.configured(),
-            "make3d": gpu_client.configured() or fal_client.configured() or _local_sam3d()}
+            "make3d": gpu_client.configured() or fal_client.configured() or _local_sam3d(),
+            # fal runs many requests at once; a single GPU (Colab or local) takes one object at a time
+            "make3dParallel": 4 if fal_client.configured() and not gpu_client.configured() else 1}
 
 
 def _local_sam3d() -> bool:

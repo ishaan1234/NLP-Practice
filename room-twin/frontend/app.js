@@ -483,18 +483,21 @@ function fillInspector() {
   }
 }
 
-// Photo cut-outs -> real 3D models (SAM 3D Objects on a local or remote GPU), one request per
-// object so the room is usable straight away and each call stays short.
+// Photo cut-outs -> real 3D models (SAM 3D Objects on fal.ai or a local / remote GPU), one request
+// per object so the room is usable straight away and each call stays short. fal takes several at
+// once (caps.make3dParallel); a single GPU takes them one by one.
 let making3d = false;
 async function make3d(list) {
   if (making3d || !project) return;
   making3d = true;
   const pid = project.id;
-  try {
-    for (let i = 0; i < list.length; i++) {
-      const o = list[i];
+  const queue = [...list];
+  let started = 0, stop = false;
+  const worker = async () => {
+    while (queue.length && !stop) {
+      const o = queue.shift();
       if (project?.id !== pid || !byId(o.id) || o.kind !== 'cutout') continue;
-      showReply(`Making 3D models… ${i + 1} of ${list.length} (${o.label})`);
+      showReply(`Making 3D models… ${++started} of ${list.length} (${o.label})`);
       try {
         const res = await api(`/api/projects/${pid}/objects/${o.id}/3d`, { method: 'POST' });
         if (project?.id !== pid || !byId(o.id)) continue;
@@ -505,9 +508,12 @@ async function make3d(list) {
       } catch (err) {
         o.failed3d = true;
         console.warn('3D failed for', o.label, err);
-        if (/501/.test(err.message) || /no 3D reconstructor/.test(err.message)) break;
+        if (/501/.test(err.message) || /no 3D reconstructor/.test(err.message)) stop = true;
       }
     }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(caps.make3dParallel || 1, list.length) }, worker));
     showReply('3D models done');
   } finally {
     making3d = false;
