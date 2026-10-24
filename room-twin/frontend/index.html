@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Room Twin</title>
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <header>
+    <div class="brand">Room Twin</div>
+    <input id="sceneName" class="scene-name" value="" placeholder="Untitled room" disabled />
+    <div class="toolbar">
+      <div class="seg" id="modeSeg">
+        <button data-mode="translate" class="active" title="Move (W)">Move</button>
+        <button data-mode="rotate" title="Rotate (E)">Rotate</button>
+        <button data-mode="scale" title="Scale (R)">Scale</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="snap" checked /> Snap</label>
+      <label class="chk"><input type="checkbox" id="photoWalls" checked /> Photo walls</label>
+      <button id="topView" title="Top view (T)">Top</button>
+      <button id="persView" title="Perspective (P)">3D</button>
+      <button id="eyeView" title="Stand where the photo was taken (V)">Eye</button>
+      <button id="undo" title="Undo (Ctrl+Z)">Undo</button>
+      <button id="save" class="primary">Save</button>
+      <button id="exportGlb">Export GLB</button>
+    </div>
+    <div id="caps" class="caps"></div>
+  </header>
+
+  <main>
+    <aside class="left">
+      <section>
+        <h2>New twin</h2>
+        <label class="drop" id="drop">
+          <input type="file" id="files" accept="image/*" multiple hidden />
+          <span>Drop room photos or one 360° image<br /><small>or click to choose</small></span>
+        </label>
+        <div id="thumbs" class="thumbs"></div>
+        <div class="grid2">
+          <label>Mode
+            <select id="mode">
+              <option value="auto">Auto-detect</option>
+              <option value="multiview">Photos (multi-angle)</option>
+              <option value="360">360° equirect</option>
+            </select>
+          </label>
+          <label>Camera height (m)<input type="number" id="camH" value="1.5" step="0.05" min="0.3" max="3" /></label>
+          <label>Room W (m)<input type="number" id="roomW" value="5" step="0.1" /></label>
+          <label>Room D (m)<input type="number" id="roomD" value="4" step="0.1" /></label>
+        </div>
+        <label>Objects to find (SAM 3 prompts)
+          <input type="text" id="prompts" placeholder="default: chair, sofa, table, bed, lamp, plant…" />
+        </label>
+        <label class="chk"><input type="checkbox" id="recon" checked /> Reconstruct 3D (SAM 3D Objects)</label>
+        <button id="build" class="primary wide" disabled>Build twin</button>
+        <div id="progress" class="progress hidden"><div class="bar"></div><span></span></div>
+      </section>
+
+      <section>
+        <h2>Projects</h2>
+        <ul id="projects" class="list"></ul>
+      </section>
+    </aside>
+
+    <div id="viewport">
+      <div id="hint" class="hint">Upload photos of your room to start — or open a project.</div>
+    </div>
+
+    <aside class="right">
+      <section>
+        <h2>Add items</h2>
+        <div id="library" class="library"></div>
+        <div class="row">
+          <label class="btn">From photo…<input type="file" id="itemPhoto" accept="image/*" hidden /></label>
+          <label class="btn">Import .glb…<input type="file" id="importGlb" accept=".glb,.ply" hidden /></label>
+        </div>
+        <input type="text" id="itemPrompt" placeholder="what's in the photo? (optional, e.g. armchair)" />
+      </section>
+
+      <section id="inspector" class="hidden">
+        <h2>Selected</h2>
+        <label>Label<input type="text" id="iLabel" /></label>
+        <div class="grid3">
+          <label>X<input type="number" id="iX" step="0.05" /></label>
+          <label>Y<input type="number" id="iY" step="0.05" /></label>
+          <label>Z<input type="number" id="iZ" step="0.05" /></label>
+        </div>
+        <label>Rotation (°)<input type="range" id="iRot" min="-180" max="180" step="1" /></label>
+        <label>Scale<input type="range" id="iScale" min="0.2" max="3" step="0.01" /></label>
+        <label class="color-row">Colour<input type="color" id="iColor" /></label>
+        <div class="row">
+          <button id="iDup">Duplicate</button>
+          <button id="iDrop">Drop to floor</button>
+          <button id="iDel" class="danger">Delete</button>
+        </div>
+        <div id="iSource" class="source"></div>
+      </section>
+
+      <section>
+        <h2>Room</h2>
+        <div class="grid3">
+          <label>W<input type="number" id="rW" step="0.1" /></label>
+          <label>D<input type="number" id="rD" step="0.1" /></label>
+          <label>H<input type="number" id="rH" step="0.1" /></label>
+        </div>
+        <div class="grid2">
+          <label class="color-row">Floor<input type="color" id="rFloor" /></label>
+          <label class="color-row">Walls<input type="color" id="rWall" /></label>
+        </div>
+      </section>
+
+      <section>
+        <h2>Objects <span id="objCount" class="muted"></span></h2>
+        <ul id="outliner" class="list"></ul>
+      </section>
+    </aside>
+  </main>
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

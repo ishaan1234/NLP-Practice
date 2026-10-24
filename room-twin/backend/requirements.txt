@@ -1,0 +1,12 @@
+# Core (runs everywhere, CPU-only demo mode)
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+pillow>=10.0
+numpy>=1.26
+
+# Optional: real models (GPU strongly recommended). See README.
+#   SAM 3            -> https://github.com/facebookresearch/sam3
+#   SAM 3D Objects   -> https://github.com/facebookresearch/sam-3d-objects
+# torch>=2.5
+# trimesh>=4.0
