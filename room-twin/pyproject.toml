@@ -1,0 +1,16 @@
+# What Vercel installs and runs (Root Directory: room-twin). Local development
+# can keep using backend/requirements.txt; the GPU models don't fit on Vercel.
+[project]
+name = "room-twin"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.110",
+    "python-multipart>=0.0.9",
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "vercel-blob>=0.5.0",
+]
+
+[tool.vercel]
+entrypoint = "backend.app.main:app"

@@ -9,10 +9,16 @@ import { normalizeLayout, alignTwin, applyAlignment } from './scanmerge.js';
 
 THREE.Cache.enabled = true;
 const $ = (id) => document.getElementById(id);
-const api = (path, opts) => fetch(path, opts).then(async (r) => {
+// On a shared deployment a room belongs to the browser that made it; this random key says which one.
+const owner = (() => {
+  const make = () => [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  try { return (localStorage.roomTwinOwner ||= make()); } catch { return make(); }
+})();
+const api = (path, opts = {}) => fetch(path, { ...opts, headers: { ...opts.headers, 'X-Owner': owner } }).then(async (r) => {
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
   return r.json();
 });
+let caps = {}; // what the server can do, from /api/capabilities
 const deg = THREE.MathUtils.radToDeg, rad = THREE.MathUtils.degToRad;
 const SNAP = 0.05;
 
@@ -143,9 +149,14 @@ async function save() {
   if (!project) return;
   clearTimeout(saveTimer);
   project.name = $('sceneName').value || 'Untitled room';
-  await api(`/api/projects/${project.id}/scene`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(project),
-  });
+  try {
+    await api(`/api/projects/${project.id}/scene`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(project),
+    });
+  } catch (err) {
+    $('save').textContent = 'Save*';
+    return toast(`Not saved: ${err.message}`, 5000);
+  }
   $('save').textContent = 'Saved';
   setTimeout(() => ($('save').textContent = 'Save'), 1200);
 }
@@ -677,6 +688,8 @@ function addPrimitive(type, at) {
 
 async function addItemFromFile(file) {
   if (!project) return toast('Open or build a room first');
+  file = await shrinkForUpload(file);
+  if (caps.maxUpload && file.size > caps.maxUpload) return toast('That photo is too big to upload here');
   const fd = new FormData();
   fd.append('file', file, file.name || 'pasted.png');
   fd.append('prompt', $('itemPrompt').value);
@@ -736,6 +749,9 @@ $('importGlb').onchange = async (e) => {
   const file = e.target.files[0];
   e.target.value = '';
   if (!file || !project) return toast('Open or build a room first');
+  if (caps.maxUpload && file.size > caps.maxUpload) {
+    return toast(`Models over ${(caps.maxUpload / 1e6).toFixed(1)} MB can't be uploaded here`, 5000);
+  }
   const fd = new FormData();
   fd.append('file', file);
   try {
@@ -1119,9 +1135,68 @@ drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
 drop.ondragleave = () => drop.classList.remove('over');
 drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); setFiles(e.dataTransfer.files); };
 
+// The camera info (Exif) of a JPEG with the rotation tag reset, for pixels that are already upright.
+async function exifSegment(file) {
+  try {
+    const b = new DataView(await file.slice(0, 256 * 1024).arrayBuffer());
+    if (b.getUint16(0) !== 0xffd8) return null;
+    for (let off = 2; off + 4 <= b.byteLength;) {
+      const marker = b.getUint16(off), len = b.getUint16(off + 2);
+      if (marker === 0xffda || (marker & 0xff00) !== 0xff00) return null; // image data: no Exif
+      if (marker === 0xffe1 && b.getUint32(off + 4) === 0x45786966) { // "Exif"
+        if (off + 2 + len > b.byteLength) return null;
+        const seg = new Uint8Array(b.buffer.slice(off, off + 2 + len));
+        const v = new DataView(seg.buffer), tiff = 10, le = v.getUint16(tiff) === 0x4949;
+        const ifd = tiff + v.getUint32(tiff + 4, le);
+        for (let i = 0, n = v.getUint16(ifd, le); i < n; i++) {
+          const e = ifd + 2 + i * 12;
+          if (v.getUint16(e, le) === 0x0112) v.setUint16(e + 8, 1, le); // Orientation: upright
+        }
+        return seg;
+      }
+      off += 2 + len;
+    }
+  } catch { /* unreadable: send the photo without it */ }
+  return null;
+}
+
+// Vercel takes at most 4.5 MB per request, so photos are shrunk in the browser to the size the
+// server works at anyway (1600 px wide, 4096 for a panorama). The camera info goes along so the
+// lens can still be read from it.
+async function shrinkForUpload(file) {
+  if (!caps.maxUpload) return file;
+  let bmp;
+  try { bmp = await createImageBitmap(file); } catch { return file; } // applies the Exif rotation
+  const maxW = bmp.width / bmp.height >= 1.9 ? 4096 : 1600;
+  if (bmp.width <= maxW && file.size < 1.5e6) { bmp.close(); return file; }
+  const s = Math.min(1, maxW / bmp.width);
+  const canvas = Object.assign(document.createElement('canvas'),
+    { width: Math.round(bmp.width * s), height: Math.round(bmp.height * s) });
+  canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  bmp.close();
+  const jpeg = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.9));
+  const exif = await exifSegment(file);
+  return new File(exif ? [jpeg.slice(0, 2), exif, jpeg.slice(2)] : [jpeg],
+    `${file.name.replace(/\.\w+$/, '') || 'photo'}.jpg`, { type: 'image/jpeg' });
+}
+
 $('build').onclick = async () => {
+  const prog = $('progress');
+  prog.querySelector('.bar').style.width = '0';
+  prog.querySelector('span').textContent = 'uploading…';
+  prog.classList.remove('hidden');
+  $('build').disabled = true;
+  const files = await Promise.all(pending.map((p) => shrinkForUpload(p.file)));
+  if (caps.maxUpload && files.reduce((n, f) => n + f.size, 0) > caps.maxUpload) {
+    toast(`Those photos come to more than ${(caps.maxUpload / 1e6).toFixed(1)} MB, the upload limit here. Use fewer.`, 6000);
+    prog.classList.add('hidden');
+    $('build').disabled = false;
+    return;
+  }
+  // a deployed server builds the twin before it answers, so there is no progress to poll
+  if (caps.deployed) prog.querySelector('span').textContent = 'building… (a minute or two)';
   const fd = new FormData();
-  pending.forEach((p) => fd.append('files', p.file));
+  files.forEach((f) => fd.append('files', f));
   fd.append('name', pending[0]?.file.name.replace(/\.\w+$/, '') || 'My room');
   fd.append('mode', $('mode').value);
   fd.append('yaws', JSON.stringify(pending.map((p) => p.yaw)));
@@ -1132,12 +1207,14 @@ $('build').onclick = async () => {
   fd.append('room_depth', $('roomD').value);
   fd.append('prompts', $('prompts').value);
   fd.append('reconstruct', $('recon').checked);
-  $('build').disabled = true;
   try {
     const { id } = await api('/api/projects', { method: 'POST', body: fd });
     await poll(id);
     await openProject(id);
-  } catch (err) { toast(`Build failed: ${err.message}`, 6000); }
+  } catch (err) {
+    toast(`Build failed: ${err.message}`, 6000);
+    prog.classList.add('hidden');
+  }
   $('build').disabled = false;
   refreshProjects();
 };
@@ -1206,6 +1283,11 @@ async function refreshProjects() {
     ul.appendChild(li);
   }
 }
+
+api('/api/capabilities').then((c) => {
+  caps = c;
+  if (c.storage === 'temporary') toast('Rooms are not kept on this deployment yet: connect a Vercel Blob store to save them', 8000);
+}).catch(() => {});
 
 refreshProjects().then(() => {
   const id = location.hash.slice(1);
