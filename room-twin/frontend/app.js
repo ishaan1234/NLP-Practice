@@ -53,6 +53,13 @@ transform.setRotationSnap(rad(15));
 transform.showY = false;
 scene.add(transform);
 
+const selBox = new THREE.BoxHelper(new THREE.Object3D(), 0x2f9f84);
+const hoverBox = new THREE.BoxHelper(new THREE.Object3D(), 0x999999);
+hoverBox.material.transparent = true;
+hoverBox.material.opacity = 0.6;
+selBox.visible = hoverBox.visible = false;
+scene.add(selBox, hoverBox);
+
 function resize() {
   const { clientWidth: w, clientHeight: h } = viewport;
   renderer.setSize(w, h, false);
@@ -60,14 +67,48 @@ function resize() {
   camera.updateProjectionMatrix();
 }
 new ResizeObserver(resize).observe(viewport);
-renderer.setAnimationLoop(() => { orbit.update(); renderer.render(scene, camera); });
+renderer.setAnimationLoop(() => { orbit.update(); updateOverlays(); renderer.render(scene, camera); });
 
 // ---------------------------------------------------------------- state
 let project = null; // scene.json contents
 const nodes = new Map(); // object id -> THREE.Group
 let selected = null;
+let hovered = null;
 const undoStack = [];
+const redoStack = [];
 let saveTimer = null;
+
+function updateOverlays() {
+  const n = selected && nodes.get(selected);
+  const o = n && byId(selected);
+  selBox.visible = !!n && n.visible;
+  const label = $('dimLabel');
+  if (selBox.visible) {
+    selBox.setFromObject(n);
+    const b = new THREE.Box3().setFromObject(n);
+    const s = o.size ? o.size.map((v, i) => v * (o.scale?.[i] ?? 1)) : b.getSize(new THREE.Vector3()).toArray();
+    const top = new THREE.Vector3((b.min.x + b.max.x) / 2, b.max.y + 0.05, (b.min.z + b.max.z) / 2).project(camera);
+    const visible = top.z < 1 && Math.abs(top.x) < 1 && Math.abs(top.y) < 1;
+    label.classList.toggle('hidden', !visible || !!drag?.moved);
+    label.style.left = `${((top.x + 1) / 2) * viewport.clientWidth}px`;
+    label.style.top = `${((1 - top.y) / 2) * viewport.clientHeight}px`;
+    label.textContent = `${o.locked ? '🔒 ' : ''}${o.label} · ${s[0].toFixed(2)} × ${s[2].toFixed(2)} × ${s[1].toFixed(2)} m`;
+  } else label.classList.add('hidden');
+  const h = hovered && hovered !== selected && nodes.get(hovered);
+  hoverBox.visible = !!h && h.visible;
+  if (hoverBox.visible) hoverBox.setFromObject(h);
+}
+
+function updateTips() {
+  const tips = $('tips');
+  tips.classList.toggle('hidden', !project);
+  const o = selected && byId(selected);
+  if (!o) tips.innerHTML = 'Click an object to select it · drag empty space to orbit · drag furniture in from the right · <kbd>?</kbd> shortcuts';
+  else if (o.locked) tips.innerHTML = `<b>${escapeHtml(o.label)}</b> is locked · press <kbd>L</kbd> to unlock`;
+  else tips.innerHTML = 'Drag to move · <kbd>Shift</kbd>+drag rotate · arrows nudge · <kbd>Alt</kbd> no wall snap · <kbd>Del</kbd> delete';
+}
+
+const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function toast(msg, ms = 2500) {
   const t = $('toast');
@@ -81,6 +122,13 @@ function checkpoint() {
   if (!project) return;
   undoStack.push(JSON.stringify(project.objects));
   if (undoStack.length > 60) undoStack.shift();
+  redoStack.length = 0;
+  updateHistoryButtons();
+}
+
+function updateHistoryButtons() {
+  $('undo').disabled = !undoStack.length;
+  $('redo').disabled = !redoStack.length;
 }
 
 function markDirty() {
@@ -238,6 +286,7 @@ function applyTransform(g, o) {
   g.position.fromArray(o.position);
   g.rotation.set(0, o.rotationY || 0, 0);
   g.scale.fromArray(o.scale || [1, 1, 1]);
+  g.visible = !o.hidden;
 }
 
 function rebuildObjects() {
@@ -290,10 +339,59 @@ function syncFromNode(id) {
 function select(id) {
   selected = id;
   const n = id && nodes.get(id);
-  if (n) transform.attach(n); else transform.detach();
+  const o = id && byId(id);
+  if (n && !o.locked && !o.hidden) transform.attach(n); else transform.detach();
   $('inspector').classList.toggle('hidden', !n);
   document.querySelectorAll('#outliner li').forEach((li) => li.classList.toggle('active', li.dataset.id === id));
   if (n) fillInspector();
+  updateTips();
+}
+
+function toggleFlag(id, flag) {
+  const o = byId(id);
+  if (!o) return;
+  checkpoint();
+  o[flag] = !o[flag];
+  applyTransform(nodes.get(id), o);
+  if (id === selected) select(id);
+  renderOutliner();
+  markDirty();
+}
+
+function focusSelected() {
+  const n = selected && nodes.get(selected);
+  if (!n) return;
+  const b = new THREE.Box3().setFromObject(n);
+  const c = b.getCenter(new THREE.Vector3());
+  const r = Math.max(0.6, b.getSize(new THREE.Vector3()).length());
+  const dir = camera.position.clone().sub(orbit.target).normalize();
+  orbit.target.copy(c);
+  camera.position.copy(c).addScaledVector(dir, r * 1.8);
+  orbit.update();
+}
+
+function rotateSelected(deltaDeg) {
+  const o = byId(selected);
+  if (!o || o.locked) return;
+  checkpoint();
+  o.rotationY = rad(Math.round((deg(o.rotationY || 0) + deltaDeg) * 100) / 100);
+  o.rotationY = Math.atan2(Math.sin(o.rotationY), Math.cos(o.rotationY));
+  applyTransform(nodes.get(o.id), o);
+  fillInspector();
+  markDirty();
+}
+
+function nudgeSelected(dx, dz) {
+  const o = byId(selected);
+  if (!o || o.locked) return;
+  checkpoint();
+  const n = nodes.get(o.id);
+  n.position.x += dx;
+  n.position.z += dz;
+  keepInRoom(n, false);
+  syncFromNode(o.id);
+  fillInspector();
+  markDirty();
 }
 
 function fillInspector() {
@@ -304,6 +402,9 @@ function fillInspector() {
   $('iRot').value = Math.round(deg(o.rotationY || 0));
   $('iScale').value = o.scale[0];
   $('iColor').value = o.color || (o.kind === 'primitive' ? LIBRARY[o.type]?.color : '#ffffff') || '#ffffff';
+  $('iLock').checked = !!o.locked;
+  $('iHide').checked = !!o.hidden;
+  for (const id of ['iX', 'iY', 'iZ', 'iRot', 'iScale', 'iRotL', 'iRotR', 'iDrop']) $(id).disabled = !!o.locked;
   const src = $('iSource');
   src.innerHTML = '';
   const info = document.createElement('div');
@@ -338,10 +439,21 @@ function renderOutliner() {
   for (const o of project?.objects || []) {
     const li = document.createElement('li');
     li.dataset.id = o.id;
-    li.innerHTML = `<span></span><span class="muted"></span>`;
-    li.children[0].textContent = o.label;
-    li.children[1].textContent = o.kind;
+    li.title = `${o.kind} · double-click to focus`;
+    const thumb = o.cutout ? Object.assign(document.createElement('img'), { src: o.cutout, alt: '' })
+      : Object.assign(document.createElement('span'), { textContent: LIBRARY[o.type]?.icon || '🧊' });
+    thumb.className = 'thumb';
+    const name = Object.assign(document.createElement('span'), { className: 'name', textContent: o.label });
+    const eye = Object.assign(document.createElement('button'), {
+      className: `ico${o.hidden ? ' on' : ''}`, textContent: o.hidden ? '🙈' : '👁', title: o.hidden ? 'Show (H)' : 'Hide (H)' });
+    const lock = Object.assign(document.createElement('button'), {
+      className: `ico${o.locked ? ' on' : ''}`, textContent: o.locked ? '🔒' : '🔓', title: o.locked ? 'Unlock (L)' : 'Lock (L)' });
+    eye.onclick = (e) => { e.stopPropagation(); toggleFlag(o.id, 'hidden'); };
+    lock.onclick = (e) => { e.stopPropagation(); toggleFlag(o.id, 'locked'); };
+    li.append(thumb, name, eye, lock);
     li.onclick = () => select(o.id);
+    li.ondblclick = () => { select(o.id); focusSelected(); };
+    if (o.hidden) li.classList.add('hidden-obj');
     if (o.id === selected) li.classList.add('active');
     ul.appendChild(li);
   }
@@ -370,6 +482,11 @@ $('iColor').oninput = (e) => {
   markDirty();
 };
 $('iDel').onclick = () => selected && removeObject(selected);
+$('iRotL').onclick = () => rotateSelected(-90);
+$('iRotR').onclick = () => rotateSelected(90);
+$('iLock').onchange = () => selected && toggleFlag(selected, 'locked');
+$('iHide').onchange = () => selected && toggleFlag(selected, 'hidden');
+$('iFocus').onclick = focusSelected;
 $('iDup').onclick = duplicate;
 $('iDrop').onclick = () => {
   const o = byId(selected);
@@ -403,6 +520,7 @@ transform.addEventListener('objectChange', () => {
     n.scale.setScalar(Math.max(0.05, n.scale[axis]));
   }
   n.position.y = Math.max(0, n.position.y);
+  if (transform.mode === 'translate') keepInRoom(n, false);
 });
 
 // ---------------------------------------------------------------- picking + drag-on-floor
@@ -418,7 +536,7 @@ function setNdc(e) {
 
 function pickObject(e) {
   setNdc(e);
-  const hit = raycaster.intersectObjects(objectsGroup.children, true)
+  const hit = raycaster.intersectObjects(objectsGroup.children.filter((c) => c.visible), true)
     .find((h) => h.object.visible && !(h.object.material?.opacity < 0.2));
   let o = hit?.object;
   while (o && !o.userData.id) o = o.parent;
@@ -431,28 +549,56 @@ function floorPoint(e, y = 0) {
   return raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -y), p) ? p : null;
 }
 
-function clampToRoom(n) {
+const WALL_SNAP = 0.15;
+
+// Keep the object's footprint inside the room; within WALL_SNAP of a wall, pull it flush.
+function keepInRoom(n, snapToWall = true) {
   if (!project) return;
   const r = project.room;
-  n.position.x = THREE.MathUtils.clamp(n.position.x, -r.width / 2, r.width / 2);
-  n.position.z = THREE.MathUtils.clamp(n.position.z, -r.depth / 2, r.depth / 2);
+  const b = new THREE.Box3().setFromObject(n);
+  const s = snapToWall ? WALL_SNAP : 0;
+  for (const [axis, half] of [['x', r.width / 2], ['z', r.depth / 2]]) {
+    if (b.max[axis] - b.min[axis] >= 2 * half) continue; // bigger than the room: leave it be
+    if (b.min[axis] < -half + s) n.position[axis] += -half - b.min[axis];
+    else if (b.max[axis] > half - s) n.position[axis] += half - b.max[axis];
+  }
 }
 
 renderer.domElement.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || transform.axis) return; // gizmo has priority
   const id = pickObject(e);
   select(id);
-  if (!id || transform.mode !== 'translate') return;
+  const o = id && byId(id);
+  if (!o || o.locked) return;
   const n = nodes.get(id);
-  const p = floorPoint(e, n.position.y);
-  if (!p) return;
-  drag = { id, offset: n.position.clone().sub(p), moved: false };
+  if (e.shiftKey) {
+    drag = { id, rotate: true, startX: e.clientX, startRot: n.rotation.y, moved: false };
+  } else {
+    if (transform.mode !== 'translate') return;
+    const p = floorPoint(e, n.position.y);
+    if (!p) return;
+    drag = { id, offset: n.position.clone().sub(p), moved: false };
+  }
   orbit.enabled = false;
+  renderer.domElement.classList.add('grabbing');
   renderer.domElement.setPointerCapture(e.pointerId);
 });
 renderer.domElement.addEventListener('pointermove', (e) => {
-  if (!drag) return;
+  if (!drag) {
+    if (e.buttons) return;
+    const id = project ? pickObject(e) : null;
+    hovered = id;
+    renderer.domElement.classList.toggle('grab', !!id && !byId(id)?.locked);
+    return;
+  }
   const n = nodes.get(drag.id);
+  if (drag.rotate) {
+    if (!drag.moved) { checkpoint(); drag.moved = true; }
+    let a = drag.startRot + (e.clientX - drag.startX) * 0.012;
+    if ($('snap').checked) a = Math.round(a / rad(15)) * rad(15);
+    n.rotation.y = Math.atan2(Math.sin(a), Math.cos(a));
+    return;
+  }
   const p = floorPoint(e, n.position.y);
   if (!p) return;
   if (!drag.moved) { checkpoint(); drag.moved = true; }
@@ -460,14 +606,16 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   if ($('snap').checked) { p.x = Math.round(p.x / SNAP) * SNAP; p.z = Math.round(p.z / SNAP) * SNAP; }
   n.position.x = p.x;
   n.position.z = p.z;
-  clampToRoom(n);
+  keepInRoom(n, !e.altKey);
 });
 renderer.domElement.addEventListener('pointerup', () => {
   if (!drag) return;
   if (drag.moved) { syncFromNode(drag.id); fillInspector(); markDirty(); }
   drag = null;
   orbit.enabled = true;
+  renderer.domElement.classList.remove('grabbing');
 });
+renderer.domElement.addEventListener('pointerleave', () => { if (!drag) hovered = null; });
 
 // ---------------------------------------------------------------- library + new items
 function spawnPoint() {
@@ -481,12 +629,51 @@ function spawnPoint() {
   return p;
 }
 
+// Nearest spot (spiralling out from p) where a w×d footprint doesn't overlap anything.
+function freeSpot(p, w, d) {
+  const r = project.room;
+  const taken = [...nodes.values()].filter((n) => n.visible).map((n) => new THREE.Box3().setFromObject(n));
+  const fits = (x, z) => {
+    const b = new THREE.Box3(new THREE.Vector3(x - w / 2, 0.02, z - d / 2), new THREE.Vector3(x + w / 2, 1, z + d / 2));
+    return !taken.some((t) => t.intersectsBox(b));
+  };
+  const cx = (v, half, s) => THREE.MathUtils.clamp(v, -half + s / 2, half - s / 2);
+  for (let ring = 0; ring < 14; ring++) {
+    const steps = Math.max(1, ring * 8);
+    for (let k = 0; k < steps; k++) {
+      const a = (k / steps) * Math.PI * 2;
+      const x = cx(p.x + Math.cos(a) * ring * 0.3, r.width / 2, w);
+      const z = cx(p.z + Math.sin(a) * ring * 0.3, r.depth / 2, d);
+      if (fits(x, z)) return new THREE.Vector3(x, 0, z);
+    }
+  }
+  return p;
+}
+
 function addPrimitive(type, at) {
   if (!project) return toast('Open or build a room first');
   const def = LIBRARY[type];
-  const p = at || spawnPoint();
-  addObject({ id: newId(), label: type, kind: 'primitive', type, color: def.color, size: [...def.size],
-    position: [p.x, 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: 'floor' });
+  const p = at || freeSpot(spawnPoint(), def.size[0], def.size[2]);
+  const o = { id: newId(), label: type, kind: 'primitive', type, color: def.color, size: [...def.size],
+    position: [p.x, 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: 'floor' };
+  addObject(o);
+  keepInRoom(nodes.get(o.id), false);
+  syncFromNode(o.id);
+}
+
+async function addItemFromFile(file) {
+  if (!project) return toast('Open or build a room first');
+  const fd = new FormData();
+  fd.append('file', file, file.name || 'pasted.png');
+  fd.append('prompt', $('itemPrompt').value);
+  toast('Cutting out the item and building it in 3D…', 60000);
+  try {
+    const item = await api(`/api/projects/${project.id}/items`, { method: 'POST', body: fd });
+    const p = freeSpot(spawnPoint(), item.size[0], item.size[2]);
+    item.position = [p.x, 0, p.z];
+    addObject(item);
+    toast(`Added ${item.label} — drag it into place`);
+  } catch (err) { toast(`Failed: ${err.message}`); }
 }
 
 for (const [type, def] of Object.entries(LIBRARY)) {
@@ -497,28 +684,38 @@ for (const [type, def] of Object.entries(LIBRARY)) {
   b.ondragstart = (e) => e.dataTransfer.setData('text/room-item', type);
   $('library').appendChild(b);
 }
-renderer.domElement.addEventListener('dragover', (e) => e.preventDefault());
-renderer.domElement.addEventListener('drop', (e) => {
+// Viewport accepts library pieces (dropped where the cursor is) and image files.
+const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+let dragDepth = 0;
+viewport.addEventListener('dragenter', (e) => {
+  if (hasFiles(e)) { dragDepth++; $('dropOverlay').classList.remove('hidden'); }
+  $('dropOverlay').textContent = project ? 'Drop a photo to add it as an item' : 'Drop room photos to start a new twin';
+});
+viewport.addEventListener('dragleave', (e) => {
+  if (hasFiles(e) && --dragDepth <= 0) { dragDepth = 0; $('dropOverlay').classList.add('hidden'); }
+});
+viewport.addEventListener('dragover', (e) => e.preventDefault());
+viewport.addEventListener('drop', (e) => {
   e.preventDefault();
+  dragDepth = 0;
+  $('dropOverlay').classList.add('hidden');
   const type = e.dataTransfer.getData('text/room-item');
-  if (type) addPrimitive(type, floorPoint(e) || undefined);
+  if (type) return addPrimitive(type, floorPoint(e) || undefined);
+  const images = [...e.dataTransfer.files].filter((f) => f.type.startsWith('image/'));
+  if (!images.length) return;
+  if (project) images.forEach(addItemFromFile);
+  else { setFiles(images); toast('Photos added — check directions, then press Build twin'); }
+});
+addEventListener('paste', (e) => {
+  if (e.target.matches?.('input, textarea')) return;
+  const img = [...(e.clipboardData?.files || [])].find((f) => f.type.startsWith('image/'));
+  if (img) { e.preventDefault(); addItemFromFile(img); }
 });
 
-$('itemPhoto').onchange = async (e) => {
+$('itemPhoto').onchange = (e) => {
   const file = e.target.files[0];
   e.target.value = '';
-  if (!file || !project) return toast('Open or build a room first');
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('prompt', $('itemPrompt').value);
-  toast('Segmenting + reconstructing item…', 60000);
-  try {
-    const item = await api(`/api/projects/${project.id}/items`, { method: 'POST', body: fd });
-    const p = spawnPoint();
-    item.position = [p.x, 0, p.z];
-    addObject(item);
-    toast(`Added ${item.label} (${item.kind})`);
-  } catch (err) { toast(`Failed: ${err.message}`); }
+  if (file) addItemFromFile(file);
 };
 
 $('importGlb').onchange = async (e) => {
@@ -529,7 +726,7 @@ $('importGlb').onchange = async (e) => {
   fd.append('file', file);
   try {
     const { asset, kind } = await api(`/api/projects/${project.id}/assets`, { method: 'POST', body: fd });
-    const p = spawnPoint();
+    const p = freeSpot(spawnPoint(), 1, 1);
     addObject({ id: newId(), label: file.name.replace(/\.\w+$/, ''), kind, asset, size: null,
       position: [p.x, 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: 'floor' });
   } catch (err) { toast(`Failed: ${err.message}`); }
@@ -573,17 +770,66 @@ $('eyeView').onclick = () => setView('eye');
 
 function undo() {
   if (!project || !undoStack.length) return;
+  redoStack.push(JSON.stringify(project.objects));
   project.objects = JSON.parse(undoStack.pop());
   rebuildObjects();
+  updateHistoryButtons();
+  markDirty();
+}
+function redo() {
+  if (!project || !redoStack.length) return;
+  undoStack.push(JSON.stringify(project.objects));
+  project.objects = JSON.parse(redoStack.pop());
+  rebuildObjects();
+  updateHistoryButtons();
   markDirty();
 }
 $('undo').onclick = undo;
+$('redo').onclick = redo;
+
+function screenshot() {
+  const hide = [selBox, hoverBox, transform].filter((o) => o.visible);
+  hide.forEach((o) => (o.visible = false));
+  renderer.render(scene, camera);
+  const a = document.createElement('a');
+  a.href = renderer.domElement.toDataURL('image/png');
+  a.download = `${(project?.name || 'room').replace(/\W+/g, '_')}.png`;
+  a.click();
+  hide.forEach((o) => (o.visible = true));
+}
+$('shot').onclick = screenshot;
+const toggleHelp = (show) => $('help').classList.toggle('hidden', !(show ?? $('help').classList.contains('hidden')));
+$('helpBtn').onclick = () => toggleHelp();
+$('helpClose').onclick = () => toggleHelp(false);
 $('save').onclick = () => save().catch((e) => toast(e.message));
 
 addEventListener('keydown', (e) => {
   if (e.target.matches('input, select, textarea')) return;
   const k = e.key.toLowerCase();
-  if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); undo(); }
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
+  else if (mod && k === 'z') { e.preventDefault(); undo(); }
+  else if (e.key === '?') toggleHelp();
+  else if (k === '[' || k === '{') rotateSelected(e.shiftKey ? -90 : -15);
+  else if (k === ']' || k === '}') rotateSelected(e.shiftKey ? 90 : 15);
+  else if (k.startsWith('arrow') && selected) {
+    e.preventDefault();
+    const step = e.shiftKey ? 0.5 : SNAP;
+    // nudge relative to the camera so "up" always moves away from you
+    const fwd = new THREE.Vector3();
+    camera.getWorldDirection(fwd);
+    fwd.y = 0;
+    if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1);
+    fwd.normalize();
+    const right = new THREE.Vector3(-fwd.z, 0, fwd.x);
+    const v = { arrowup: fwd, arrowdown: fwd.clone().negate(), arrowright: right, arrowleft: right.clone().negate() }[k];
+    // snap the direction to the nearest room axis so nudges stay on the grid
+    const ax = Math.abs(v.x) > Math.abs(v.z) ? [Math.sign(v.x), 0] : [0, Math.sign(v.z)];
+    nudgeSelected(ax[0] * step, ax[1] * step);
+  }
+  else if (k === 'f') focusSelected();
+  else if (k === 'h' && selected) toggleFlag(selected, 'hidden');
+  else if (k === 'l' && selected) toggleFlag(selected, 'locked');
   else if ((e.ctrlKey || e.metaKey) && k === 's') { e.preventDefault(); save(); }
   else if ((e.ctrlKey || e.metaKey) && k === 'd') { e.preventDefault(); duplicate(); }
   else if (k === 'w') setMode('translate');
@@ -592,7 +838,7 @@ addEventListener('keydown', (e) => {
   else if (k === 't') setView('top');
   else if (k === 'p') setView('pers');
   else if (k === 'v') setView('eye');
-  else if (k === 'escape') select(null);
+  else if (k === 'escape') { toggleHelp(false); select(null); }
   else if ((k === 'delete' || k === 'backspace') && selected) removeObject(selected);
 });
 
@@ -628,6 +874,42 @@ $('exportGlb').onclick = () => {
 // ---------------------------------------------------------------- projects + upload
 let pending = [];
 
+const DIRECTIONS = [[0, 'ahead'], [45, 'ahead-right'], [90, 'right'], [135, 'behind-right'],
+  [180, 'behind'], [225, 'behind-left'], [270, 'left'], [315, 'ahead-left']];
+
+// Which way each photo faces, relative to the first one; arrow shows it at a glance.
+function directionPicker(p, i) {
+  const wrap = document.createElement('div');
+  wrap.className = 'dir';
+  const arrow = Object.assign(document.createElement('span'), { className: 'arrow', textContent: '↑' });
+  const sel = document.createElement('select');
+  sel.title = 'Which way the camera faced, compared to the first photo';
+  const opts = DIRECTIONS.some(([d]) => d === p.yaw) ? DIRECTIONS : [...DIRECTIONS, [p.yaw, `${p.yaw}°`]];
+  for (const [d, name] of opts.sort((a, b) => a[0] - b[0])) sel.add(new Option(i === 0 && d === 0 ? 'first' : name, d));
+  sel.value = p.yaw;
+  sel.disabled = i === 0;
+  const sync = () => (arrow.style.transform = `rotate(${p.yaw}deg)`);
+  sel.onchange = () => { p.yaw = +sel.value; sync(); };
+  sync();
+  wrap.append(arrow, sel);
+  return wrap;
+}
+
+async function startBlank(e) {
+  e?.preventDefault();
+  const fd = new FormData();
+  fd.append('room_width', $('roomW').value);
+  fd.append('room_depth', $('roomD').value);
+  try {
+    const { id } = await api('/api/projects/blank', { method: 'POST', body: fd });
+    await openProject(id);
+    refreshProjects();
+    toast('Blank room ready — add furniture from the right panel');
+  } catch (err) { toast(err.message); }
+}
+$('blank').onclick = startBlank;
+$('hintBlank').onclick = startBlank;
+
 function renderThumbs() {
   const box = $('thumbs');
   box.innerHTML = '';
@@ -637,14 +919,7 @@ function renderThumbs() {
     const img = document.createElement('img');
     img.src = p.url;
     fig.appendChild(img);
-    if (multi && pending.length > 1) {
-      const inp = document.createElement('input');
-      inp.type = 'number';
-      inp.value = p.yaw;
-      inp.title = 'Direction this photo faces, degrees clockwise from the first photo';
-      inp.oninput = () => (p.yaw = +inp.value);
-      fig.appendChild(inp);
-    }
+    if (multi && pending.length > 1) fig.appendChild(directionPicker(p, i));
     box.appendChild(fig);
   });
   $('build').disabled = !pending.length;
@@ -701,11 +976,13 @@ async function poll(id) {
 
 async function openProject(id) {
   project = await api(`/api/projects/${id}/scene`);
-  undoStack.length = 0;
-  selected = null;
+  undoStack.length = redoStack.length = 0;
+  updateHistoryButtons();
+  selected = hovered = null;
   $('sceneName').value = project.name || '';
   $('sceneName').disabled = false;
   $('hint').classList.add('hidden');
+  $('roomPanel').classList.remove('hidden');
   panoTexture = null;
   if (project.panorama) {
     panoTexture = await texLoader.loadAsync(project.panorama);
@@ -718,7 +995,9 @@ async function openProject(id) {
   rebuildObjects();
   setView('pers');
   const m = project.models || {};
-  $('caps').textContent = `segmenter: ${m.segmenter || '?'} · 3D: ${m.reconstructor || 'photo cutouts'}`;
+  $('caps').textContent = project.views?.length
+    ? `segmenter: ${m.segmenter || '?'} · 3D: ${m.reconstructor || 'photo cutouts'}` : 'blank room';
+  updateTips();
   document.querySelectorAll('#projects li').forEach((li) => li.classList.toggle('active', li.dataset.id === id));
   history.replaceState(null, '', `#${id}`);
 }

@@ -90,6 +90,26 @@ async def create_project(
     return {"id": pid}
 
 
+@app.post("/api/projects/blank")
+def create_blank(name: str = Form("Blank room"), room_width: float = Form(5.0),
+                 room_depth: float = Form(4.0), room_height: float = Form(2.7)):
+    """An empty room to furnish from scratch, no photos needed."""
+    pid = uuid.uuid4().hex[:12]
+    pdir = project_dir(pid)
+    pdir.mkdir(parents=True)
+    now = time.time()
+    scene = {
+        "version": 1, "id": pid, "name": name, "created": now,
+        "room": {"width": room_width, "depth": room_depth, "height": room_height,
+                 "floorColor": "#b08d6a", "wallColor": "#e9e4da", "cameraHeight": 1.5},
+        "panorama": None, "views": [], "objects": [], "models": {},
+    }
+    (pdir / "scene.json").write_text(json.dumps(scene, indent=1))
+    (pdir / "meta.json").write_text(json.dumps({"name": name, "created": now}))
+    write_status(pid, "done", 1.0, objects=0)
+    return {"id": pid}
+
+
 @app.get("/api/projects")
 def list_projects():
     out = []

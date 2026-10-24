@@ -55,16 +55,24 @@ keeps going with the fallback.
 ## Using it
 
 1. **New twin** – drop photos or one 360° image. Mode `auto` treats a ~2:1 image as a panorama.
-   For multiple photos, set the direction each one faces (degrees clockwise from the first; the
-   default spreads them evenly). Stand in one spot, roughly in the middle of the room, and turn.
+   For multiple photos, pick which way each one faces compared to the first (ahead / right /
+   behind / left …; the arrow under each thumbnail shows it). The default spreads them evenly. Stand in one spot, roughly in the middle of the room, and turn.
 2. Optionally edit the **SAM 3 prompts** (comma-separated nouns) to target what's in your room.
-3. **Edit** – click an object to select it, drag it across the floor, or use the gizmo.
-   - `W` / `E` / `R` move / rotate / scale, `Ctrl+Z` undo, `Ctrl+D` duplicate, `Del` delete
+   No photos? **Start a blank room** and furnish it from the library.
+3. **Edit** – click an object to select it (outline + live size label), drag it across the floor.
+   Objects stay inside the room and snap flush to a wall when dragged near one (hold `Alt` to
+   skip the snap). The hint bar at the bottom always shows what you can do next; `?` lists every
+   shortcut.
+   - Drag: move · `Shift`+drag: rotate · arrows: nudge 5 cm (`Shift` 50 cm) · `[ ]`: rotate 15° (`Shift` 90°)
+   - `W` / `E` / `R` gizmo modes, `F` focus, `H` hide, `L` lock, `Ctrl+D` duplicate, `Del` delete
+   - `Ctrl+Z` / `Ctrl+Shift+Z` undo / redo
    - `T` top view, `P` perspective, `V` eye view (stand where the photo was taken)
    - **Photo walls** projects the 360° image onto the room box from the capture point
-4. **Add items** – click or drag a library piece into the room, use **From photo…** to segment
-   and reconstruct an object from any product photo, or **Import .glb…** for an existing model.
-5. **Save** (it also autosaves) and **Export GLB** to open the room in Blender, Unity, etc.
+   - The **Objects** list has thumbnails plus hide 👁 / lock 🔒 toggles; lock the pieces you're happy with
+4. **Add items** – click a library piece (it lands on a free patch of floor) or drag it to an exact
+   spot. Drop or paste (`Ctrl+V`) any product photo onto the 3D view to cut it out and build it
+   in 3D, or use **Import .glb…** for an existing model.
+5. **Save** (it also autosaves), **Export GLB** for Blender / Unity, **Screenshot** for a PNG.
 
 ## How placement works
 

@@ -29,9 +29,12 @@
       <button id="topView" title="Top view (T)">Top</button>
       <button id="persView" title="Perspective (P)">3D</button>
       <button id="eyeView" title="Stand where the photo was taken (V)">Eye</button>
-      <button id="undo" title="Undo (Ctrl+Z)">Undo</button>
+      <button id="undo" title="Undo (Ctrl+Z)" disabled>Undo</button>
+      <button id="redo" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
       <button id="save" class="primary">Save</button>
-      <button id="exportGlb">Export GLB</button>
+      <button id="exportGlb" title="Download the room as a 3D model">Export GLB</button>
+      <button id="shot" title="Save a picture of the current view">Screenshot</button>
+      <button id="helpBtn" title="Keyboard shortcuts (?)">?</button>
     </div>
     <div id="caps" class="caps"></div>
   </header>
@@ -63,6 +66,8 @@
         <label class="chk"><input type="checkbox" id="recon" checked /> Reconstruct 3D (SAM 3D Objects)</label>
         <button id="build" class="primary wide" disabled>Build twin</button>
         <div id="progress" class="progress hidden"><div class="bar"></div><span></span></div>
+        <div class="or">or</div>
+        <button id="blank" class="wide" title="An empty room you furnish from the library">Start a blank room</button>
       </section>
 
       <section>
@@ -72,7 +77,36 @@
     </aside>
 
     <div id="viewport">
-      <div id="hint" class="hint">Upload photos of your room to start — or open a project.</div>
+      <div id="hint" class="empty">
+        <h3>Make a 3D twin of your room</h3>
+        <ol>
+          <li><b>Photograph it</b> from one spot, turning around — or take one 360° photo.</li>
+          <li><b>Drop the photos</b> in the panel on the left and press <i>Build twin</i>.</li>
+          <li><b>Rearrange</b>: drag furniture around, drop in new pieces, export.</li>
+        </ol>
+        <p class="muted">No photos handy? <a href="#" id="hintBlank">Start with a blank room</a>.</p>
+      </div>
+      <div id="dimLabel" class="dim hidden"></div>
+      <div id="tips" class="tips hidden"></div>
+      <div id="dropOverlay" class="drop-overlay hidden">Drop a photo to add it as an item</div>
+      <div id="help" class="help hidden">
+        <h3>Shortcuts</h3>
+        <dl>
+          <dt>Click / drag</dt><dd>Select / move along the floor</dd>
+          <dt>Shift + drag</dt><dd>Rotate the object</dd>
+          <dt>Right-drag, scroll</dt><dd>Pan, zoom the camera</dd>
+          <dt>W E R</dt><dd>Move / rotate / scale gizmo</dd>
+          <dt>[ ]</dt><dd>Rotate 15° (with Shift: 90°)</dd>
+          <dt>Arrow keys</dt><dd>Nudge 5 cm (with Shift: 50 cm)</dd>
+          <dt>F</dt><dd>Focus the camera on the selection</dd>
+          <dt>H / L</dt><dd>Hide / lock the selection</dd>
+          <dt>Ctrl D, Del</dt><dd>Duplicate, delete</dd>
+          <dt>Ctrl Z, Ctrl Shift Z</dt><dd>Undo, redo</dd>
+          <dt>T P V</dt><dd>Top / 3D / eye view</dd>
+          <dt>Ctrl V</dt><dd>Paste a photo as a new item</dd>
+        </dl>
+        <button id="helpClose">Got it</button>
+      </div>
     </div>
 
     <aside class="right">
@@ -84,6 +118,7 @@
           <label class="btn">Import .glb…<input type="file" id="importGlb" accept=".glb,.ply" hidden /></label>
         </div>
         <input type="text" id="itemPrompt" placeholder="what's in the photo? (optional, e.g. armchair)" />
+        <p class="muted small">Tip: drag a library piece onto the floor, or drop / paste (Ctrl+V) any product photo onto the 3D view.</p>
       </section>
 
       <section id="inspector" class="hidden">
@@ -94,7 +129,13 @@
           <label>Y<input type="number" id="iY" step="0.05" /></label>
           <label>Z<input type="number" id="iZ" step="0.05" /></label>
         </div>
-        <label>Rotation (°)<input type="range" id="iRot" min="-180" max="180" step="1" /></label>
+        <label>Rotation (°)
+          <div class="row tight">
+            <button id="iRotL" title="Rotate -90° (Shift+[)">⟲ 90°</button>
+            <input type="range" id="iRot" min="-180" max="180" step="1" />
+            <button id="iRotR" title="Rotate +90° (Shift+])">⟳ 90°</button>
+          </div>
+        </label>
         <label>Scale<input type="range" id="iScale" min="0.2" max="3" step="0.01" /></label>
         <label class="color-row">Colour<input type="color" id="iColor" /></label>
         <div class="row">
@@ -102,10 +143,15 @@
           <button id="iDrop">Drop to floor</button>
           <button id="iDel" class="danger">Delete</button>
         </div>
+        <div class="row">
+          <label class="chk"><input type="checkbox" id="iLock" /> Locked</label>
+          <label class="chk"><input type="checkbox" id="iHide" /> Hidden</label>
+          <button id="iFocus" title="Focus camera (F)">Focus</button>
+        </div>
         <div id="iSource" class="source"></div>
       </section>
 
-      <section>
+      <section id="roomPanel" class="hidden">
         <h2>Room</h2>
         <div class="grid3">
           <label>W<input type="number" id="rW" step="0.1" /></label>
