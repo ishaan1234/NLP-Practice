@@ -15,10 +15,10 @@ from .geometry import (View, equirect_to_perspective, estimate_pitch, hfov_from_
                        is_equirectangular, place_from_mask)
 from .layout import Bounds, fit_bounds, plausibility, prior_depth, room_rotation, wall_base_points
 from .segmenters import DEFAULT_PROMPTS, Detection
+from .storage import DATA_DIR
 
 log = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "projects"
 PANO_CROP_YAWS = [i * 45 for i in range(8)]
 PANO_CROP_PITCH = -20  # look down: furniture lives below the horizon
 # 120 x 108 deg crops: a bed 1.5 m away still fits in one view, and the floor is visible to ~0.4 m

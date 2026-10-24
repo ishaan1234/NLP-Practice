@@ -62,6 +62,29 @@ export SAM3D_REPO=$PWD/sam-3d-objects          # where notebook/inference.py liv
 Models load lazily on the first build. If either fails to import, the server logs why and
 keeps going with the fallback.
 
+## Deploy on Vercel
+
+The editor and the photo → twin flow run on Vercel's Python runtime. The GPU models don't
+(torch alone is bigger than the 500 MB function limit), so a deployed twin uses the fallback
+segmenter and photo cut-outs. For SAM 3 quality, run the backend on a GPU machine as above.
+
+1. Import the repo in Vercel and set **Root Directory** to `room-twin` (or run `vercel` from
+   `room-twin/`). `pyproject.toml` says what to install and where the app is
+   (`backend.app.main:app`); the frontend is served from Vercel's CDN.
+2. Under **Storage**, create a **Blob** store (private), connect it to the project and redeploy.
+   Without one, rooms only live on a function's temporary disk and soon disappear; the app
+   shows a warning when that's the case. For a public store, set `ROOM_TWIN_BLOB_ACCESS=public`.
+
+What's different when deployed:
+
+- A build runs inside the upload request (Vercel allows up to 300 s) rather than in a
+  background thread, so the progress bar only says "building…".
+- Requests are capped at 4.5 MB. The browser shrinks photos to the size the pipeline works at
+  anyway (1600 px wide, 4096 for a 360° image) and keeps the camera's lens info; several photos
+  together still have to fit. `.glb` imports over 4.4 MB are refused.
+- Each browser sees and edits only its own rooms (a random key kept in `localStorage`).
+  Anyone with a room's link can view it.
+
 ## Using it
 
 1. **New twin** – drop photos or one 360° image. Mode `auto` treats a ~2:1 image as a panorama.
@@ -127,8 +150,10 @@ room-twin/
     geometry.py        camera model, 360→perspective resampling, mask → 3D placement
     segmenters.py      SAM 3 adapter + fallback segmenter
     reconstructors.py  SAM 3D Objects adapter + splat→point-cloud conversion
+    storage.py         project files on local disk, or in Vercel Blob when deployed
   frontend/
     index.html, style.css, app.js   Three.js editor
     furniture.js                    procedural furniture library
   data/projects/<id>/  uploads, views, cutouts, meshes, scene.json (gitignored)
+  pyproject.toml       Vercel's dependencies + entrypoint
 ```

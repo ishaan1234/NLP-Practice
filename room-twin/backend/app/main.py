@@ -4,6 +4,7 @@ Run:  uvicorn app.main:app --app-dir backend --reload   (from room-twin/)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -13,29 +14,42 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .pipeline import DATA_DIR, Models, make_item_from_photo, project_dir, run_pipeline, write_status
+from .pipeline import Models, make_item_from_photo, project_dir, run_pipeline, write_status
+from .storage import DATA_DIR, DEPLOYED, store
 
 logging.basicConfig(level=logging.INFO)
 FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
 ALLOWED = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 PID_RE = re.compile(r"^[a-f0-9]{12}$")
+# Vercel turns away request bodies over 4.5 MB; the frontend shrinks photos to fit
+MAX_UPLOAD = 4_400_000 if DEPLOYED else None
 
 app = FastAPI(title="Room Twin")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _pdir(pid: str) -> Path:
-    if not PID_RE.match(pid):
+def _owner(key: str | None) -> str | None:
+    """The browser's random key (X-Owner header), hashed before it is stored."""
+    return hashlib.sha256(key.encode()).hexdigest()[:24] if key else None
+
+
+def _meta(pid: str) -> dict:
+    meta = store.read(pid, "meta") if PID_RE.match(pid) else None
+    if meta is None:
         raise HTTPException(404, "unknown project")
-    d = project_dir(pid)
-    if not d.exists():
-        raise HTTPException(404, "unknown project")
-    return d
+    return meta
+
+
+def _owned(pid: str, key: str | None) -> dict:
+    """On a public deployment anyone with the link can view a room, but only its maker can change it."""
+    meta = _meta(pid)
+    if DEPLOYED and meta.get("owner") not in (None, _owner(key)):
+        raise HTTPException(403, "this room belongs to someone else")
+    return meta
 
 
 def _save_upload(f: UploadFile, dest_dir: Path, stem: str) -> Path:
@@ -50,11 +64,11 @@ def _save_upload(f: UploadFile, dest_dir: Path, stem: str) -> Path:
 
 @app.get("/api/capabilities")
 def capabilities():
-    return Models.info()
+    return {**Models.info(), "storage": store.kind, "deployed": DEPLOYED, "maxUpload": MAX_UPLOAD}
 
 
 @app.post("/api/projects")
-async def create_project(
+def create_project(
     files: list[UploadFile] = File(...),
     name: str = Form("My room"),
     mode: str = Form("auto"),  # auto | 360 | multiview
@@ -67,6 +81,7 @@ async def create_project(
     room_depth: float = Form(4.0),
     room_height: float = Form(2.7),
     reconstruct: bool = Form(True),
+    x_owner: str | None = Header(None),
 ):
     if mode not in {"auto", "360", "multiview"}:
         raise HTTPException(400, "mode must be auto, 360 or multiview")
@@ -86,18 +101,21 @@ async def create_project(
         raise HTTPException(400, "pitches must be a JSON list of numbers or nulls")
     prompt_list = [p.strip() for p in prompts.split(",") if p.strip()] or None
     write_status(pid, "queued", 0.0)
-    (pdir / "meta.json").write_text(json.dumps({"name": name, "created": time.time()}))
-    threading.Thread(
-        target=run_pipeline, daemon=True,
-        args=(pid, paths, mode, yaw_list, hfov, camera_height, prompt_list,
-              (room_width, room_depth, room_height), reconstruct, name, pitch_list),
-    ).start()
+    (pdir / "meta.json").write_text(json.dumps({"name": name, "created": time.time(), "owner": _owner(x_owner)}))
+    args = (pid, paths, mode, yaw_list, hfov, camera_height, prompt_list,
+            (room_width, room_depth, room_height), reconstruct, name, pitch_list)
+    if DEPLOYED:  # a function can be frozen once it has answered: build now, then store the result
+        run_pipeline(*args)
+        store.publish(pid)
+    else:
+        threading.Thread(target=run_pipeline, daemon=True, args=args).start()
     return {"id": pid}
 
 
 @app.post("/api/projects/blank")
 def create_blank(name: str = Form("Blank room"), room_width: float = Form(5.0),
-                 room_depth: float = Form(4.0), room_height: float = Form(2.7)):
+                 room_depth: float = Form(4.0), room_height: float = Form(2.7),
+                 x_owner: str | None = Header(None)):
     """An empty room to furnish from scratch, no photos needed."""
     pid = uuid.uuid4().hex[:12]
     pdir = project_dir(pid)
@@ -110,76 +128,87 @@ def create_blank(name: str = Form("Blank room"), room_width: float = Form(5.0),
         "panorama": None, "views": [], "objects": [], "models": {},
     }
     (pdir / "scene.json").write_text(json.dumps(scene, indent=1))
-    (pdir / "meta.json").write_text(json.dumps({"name": name, "created": now}))
+    (pdir / "meta.json").write_text(json.dumps({"name": name, "created": now, "owner": _owner(x_owner)}))
     write_status(pid, "done", 1.0, objects=0)
+    store.publish(pid)
     return {"id": pid}
 
 
 @app.get("/api/projects")
-def list_projects():
-    out = []
-    for d in sorted(DATA_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if not (d / "meta.json").exists():
-            continue
-        meta = json.loads((d / "meta.json").read_text())
-        status = json.loads((d / "status.json").read_text()) if (d / "status.json").exists() else {}
-        out.append({"id": d.name, "name": meta.get("name"), "created": meta.get("created"),
-                    "stage": status.get("stage")})
-    return out
+def list_projects(x_owner: str | None = Header(None)):
+    me = _owner(x_owner)
+    return [{"id": p["id"], "name": p.get("name"), "created": p.get("created"), "stage": p.get("stage")}
+            for p in store.projects() if not DEPLOYED or p.get("owner") in (None, me)]
 
 
 @app.get("/api/projects/{pid}/status")
 def status(pid: str):
-    return json.loads((_pdir(pid) / "status.json").read_text())
+    s = store.read(pid, "status") if PID_RE.match(pid) else None
+    if s is None:
+        raise HTTPException(404, "unknown project")
+    return s
 
 
 @app.get("/api/projects/{pid}/scene")
 def get_scene(pid: str):
-    f = _pdir(pid) / "scene.json"
-    if not f.exists():
+    scene = store.read(pid, "scene") if PID_RE.match(pid) else None
+    if scene is None:
+        _meta(pid)
         raise HTTPException(409, "scene not ready")
-    return FileResponse(f, headers={"Cache-Control": "no-store"})
+    return JSONResponse(scene, headers={"Cache-Control": "no-store"})
 
 
 @app.put("/api/projects/{pid}/scene")
-def put_scene(pid: str, scene: dict):
-    d = _pdir(pid)
+def put_scene(pid: str, scene: dict, x_owner: str | None = Header(None)):
+    meta = _owned(pid, x_owner)
     scene["id"] = pid
-    (d / "scene.json").write_text(json.dumps(scene, indent=1))
-    if "name" in scene:
-        meta = json.loads((d / "meta.json").read_text())
-        meta["name"] = scene["name"]
-        (d / "meta.json").write_text(json.dumps(meta))
+    store.write(pid, "scene", scene)
+    if "name" in scene and scene["name"] != meta.get("name"):
+        store.write(pid, "meta", {**meta, "name": scene["name"]})
     return {"ok": True}
 
 
 @app.post("/api/projects/{pid}/items")
-async def add_item(pid: str, file: UploadFile = File(...), prompt: str = Form("")):
-    d = _pdir(pid)
-    (d / "uploads").mkdir(exist_ok=True)
+def add_item(pid: str, file: UploadFile = File(...), prompt: str = Form(""),
+             x_owner: str | None = Header(None)):
+    _owned(pid, x_owner)
+    d = project_dir(pid)
+    (d / "uploads").mkdir(parents=True, exist_ok=True)
     path = _save_upload(file, d / "uploads", uuid.uuid4().hex[:8])
-    return await run_in_threadpool(make_item_from_photo, pid, path, prompt.strip() or None)
+    item = make_item_from_photo(pid, path, prompt.strip() or None)
+    made = [DATA_DIR / item[k].removeprefix("files/") for k in ("cutout", "asset") if item.get(k)]
+    store.publish(pid, [path, *made])
+    return item
 
 
 @app.post("/api/projects/{pid}/assets")
-async def upload_asset(pid: str, file: UploadFile = File(...)):
+def upload_asset(pid: str, file: UploadFile = File(...), x_owner: str | None = Header(None)):
     """Raw .glb/.gltf model the user drops into the scene."""
-    d = _pdir(pid)
+    _owned(pid, x_owner)
     ext = Path(file.filename or "").suffix.lower()
     if ext not in {".glb", ".ply"}:
         raise HTTPException(400, "only .glb or .ply")
-    (d / "assets").mkdir(exist_ok=True)
-    dest = d / "assets" / f"{uuid.uuid4().hex[:8]}{ext}"
+    d = project_dir(pid) / "assets"
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / f"{uuid.uuid4().hex[:8]}{ext}"
     with open(dest, "wb") as out:
         shutil.copyfileobj(file.file, out)
+    store.publish(pid, [dest])
     return {"asset": f"files/{pid}/assets/{dest.name}", "kind": "mesh" if ext == ".glb" else "pointcloud"}
 
 
 @app.delete("/api/projects/{pid}")
-def delete_project(pid: str):
-    shutil.rmtree(_pdir(pid))
+def delete_project(pid: str, x_owner: str | None = Header(None)):
+    _owned(pid, x_owner)
+    store.delete(pid)
     return {"ok": True}
 
 
-app.mount("/files", StaticFiles(directory=DATA_DIR), name="files")
+@app.get("/files/{pid}/{path:path}")
+def project_file(pid: str, path: str):
+    if not PID_RE.match(pid) or any(s in ("", ".", "..") for s in path.split("/")):
+        raise HTTPException(404)
+    return store.file(pid, path)
+
+
 app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")
