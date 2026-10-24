@@ -100,7 +100,48 @@
     $('mRoom').onclick = () => setMode('room');
     $('mItem').onclick = () => setMode('item');
 
-    function upload(file) {
+    // Hosted servers (Vercel) refuse requests over 4.5 MB: shrink big phone photos first,
+    // keeping the camera info (Exif) so the lens can still be read from it.
+    async function exifSegment(file) {
+      try {
+        const b = new DataView(await file.slice(0, 256 * 1024).arrayBuffer());
+        if (b.getUint16(0) !== 0xffd8) return null;
+        for (let off = 2; off + 4 <= b.byteLength;) {
+          const marker = b.getUint16(off), len = b.getUint16(off + 2);
+          if (marker === 0xffda || (marker & 0xff00) !== 0xff00) return null;
+          if (marker === 0xffe1 && b.getUint32(off + 4) === 0x45786966) {
+            if (off + 2 + len > b.byteLength) return null;
+            const seg = new Uint8Array(b.buffer.slice(off, off + 2 + len));
+            const v = new DataView(seg.buffer), tiff = 10, le = v.getUint16(tiff) === 0x4949;
+            const ifd = tiff + v.getUint32(tiff + 4, le);
+            for (let i = 0, n = v.getUint16(ifd, le); i < n; i++) {
+              const e = ifd + 2 + i * 12;
+              if (v.getUint16(e, le) === 0x0112) v.setUint16(e + 8, 1, le); // pixels are upright now
+            }
+            return seg;
+          }
+          off += 2 + len;
+        }
+      } catch {}
+      return null;
+    }
+
+    async function shrink(file) {
+      if (file.size < 3.5e6) return file;
+      let bmp;
+      try { bmp = await createImageBitmap(file); } catch { return file; }
+      const maxW = bmp.width / bmp.height >= 1.9 ? 4096 : 2560;
+      const s = Math.min(1, maxW / bmp.width);
+      const canvas = Object.assign(document.createElement('canvas'), { width: Math.round(bmp.width * s), height: Math.round(bmp.height * s) });
+      canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+      bmp.close();
+      const jpeg = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.9));
+      const exif = await exifSegment(file);
+      return new File(exif ? [jpeg.slice(0, 2), exif, jpeg.slice(2)] : [jpeg], 'photo.jpg', { type: 'image/jpeg' });
+    }
+
+    async function upload(original) {
+      const file = await shrink(original);
       const tile = document.createElement('div');
       tile.className = 'shot';
       const img = new Image();

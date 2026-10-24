@@ -84,6 +84,10 @@ What's different when deployed:
   together still have to fit. `.glb` imports over 4.4 MB are refused.
 - Each browser sees and edits only its own rooms (a random key kept in `localStorage`).
   Anyone with a room's link can view it.
+- **Phone capture works there too** (and needs no `--host`/Wi-Fi setup: the QR code points at
+  the deployment's HTTPS address). Capture sessions and photos go through the same store as
+  projects, so the phone and the desktop can land on different function instances; the phone
+  page shrinks very large photos to fit the request cap, keeping the lens info.
 
 ## Using it
 

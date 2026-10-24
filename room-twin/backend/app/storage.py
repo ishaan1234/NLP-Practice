@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse, Response
 DEPLOYED = bool(os.environ.get("VERCEL"))
 # Vercel's disk is read-only apart from /tmp
 DATA_DIR = (Path("/tmp/room-twin") if DEPLOYED else Path(__file__).resolve().parents[2] / "data") / "projects"
-DOCS = ("meta", "status", "scene")
+DOCS = ("meta", "status", "scene", "capture")  # capture: phone sessions (capture.py)
 
 
 class LocalStore:

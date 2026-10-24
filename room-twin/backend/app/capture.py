@@ -6,13 +6,15 @@ Design (adapted from RoomShift's pairing flow, simplified for home-network use):
   never sent in request URLs, server logs or referrers.
 - Sessions expire after an hour; photos are re-encoded (EXIF orientation applied,
   metadata such as GPS stripped, only the lens focal length kept) and size-limited.
-- The desktop polls for new photos; no WebSocket needed.
+- The desktop polls for new photos; no WebSocket needed. Sessions and photos live in the
+  project store (storage.py), so this also works across Vercel's short-lived instances.
 """
 from __future__ import annotations
 
 import hashlib
 import io
 import os
+import re
 import secrets
 import socket
 import threading
@@ -20,8 +22,9 @@ import time
 import warnings
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import Response
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+from .storage import DATA_DIR, store
 
 router = APIRouter()
 
@@ -35,7 +38,6 @@ SESSION_SECONDS = 3600
 Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 warnings.simplefilter("error", Image.DecompressionBombWarning)
 
-_sessions: dict[str, dict] = {}
 _lock = threading.Lock()
 
 
@@ -71,19 +73,25 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def _sweep():
-    now = time.time()
-    for sid in [k for k, s in _sessions.items() if s["expires"] < now]:
-        del _sessions[sid]
+# Sessions and their photos go through the project store, so they work the same on one local
+# server and on Vercel, where the phone's upload and the desktop's poll can hit different
+# short-lived instances. A session is stored like a project named "cap<id>" with one document.
+def _key(sid: str) -> str:
+    return f"cap{sid}"
 
 
 def _get(sid: str) -> dict:
-    with _lock:
-        _sweep()
-        s = _sessions.get(sid)
-    if not s:
+    s = store.read(_key(sid), "capture") if re.fullmatch(r"[0-9a-f]{16}", sid) else None
+    if not s or s["expires"] < time.time():
+        if s:
+            store.delete(_key(sid))
         raise HTTPException(410, "This capture session has ended. Create a new QR code on the desktop.")
     return s
+
+
+def _save(sid: str, s: dict):
+    (DATA_DIR / _key(sid)).mkdir(parents=True, exist_ok=True)
+    store.write(_key(sid), "capture", s)
 
 
 def _check(s: dict, secret: str | None, key: str):
@@ -120,14 +128,10 @@ def _phone_base(request: Request) -> tuple[str, str | None]:
 
 @router.post("/api/capture")
 def create_session(request: Request):
-    with _lock:
-        _sweep()
-        if len(_sessions) >= 50:
-            raise HTTPException(503, "Too many capture sessions; try again later")
-        sid = secrets.token_hex(8)
-        owner, phone = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
-        _sessions[sid] = {"owner": _digest(owner), "phone": _digest(phone), "photos": [],
-                          "expires": time.time() + SESSION_SECONDS, "phone_seen": False}
+    sid = secrets.token_hex(8)
+    owner, phone = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+    _save(sid, {"owner": _digest(owner), "phone": _digest(phone), "photos": [],
+                "expires": time.time() + SESSION_SECONDS, "phone_seen": False})
     base, warning = _phone_base(request)
     return {"id": sid, "owner": owner, "url": f"{base}/capture.html#{sid}.{phone}",
             "warning": warning, "expires_in": SESSION_SECONDS}
@@ -138,7 +142,9 @@ def session_state(sid: str, x_capture_owner: str | None = Header(None), x_captur
     s = _get(sid)
     if x_capture_phone:  # the phone checks in when it opens the page
         _check(s, x_capture_phone, "phone")
-        s["phone_seen"] = True
+        if not s["phone_seen"]:
+            s["phone_seen"] = True
+            _save(sid, s)
     else:
         _check(s, x_capture_owner, "owner")
     return {"phone_connected": s["phone_seen"],
@@ -155,27 +161,33 @@ async def upload(sid: str, photo: UploadFile = File(...), mode: str = Form("room
     if len(s["photos"]) >= MAX_PHOTOS:
         raise HTTPException(413, f"Up to {MAX_PHOTOS} photos per session")
     data = sanitize_image(await photo.read(MAX_UPLOAD_BYTES + 1))
-    entry = {"id": secrets.token_hex(6), "mode": mode, "time": time.time(), "data": data}
-    with _lock:
-        s["photos"].append(entry)
+    pid = secrets.token_hex(6)
+    path = DATA_DIR / _key(sid) / "photos" / f"{pid}.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    store.publish(_key(sid), [path])
+    with _lock:  # the phone sends one photo at a time; this guards a single server's threads
+        s = _get(sid)
+        s["photos"].append({"id": pid, "mode": mode, "time": time.time()})
         s["phone_seen"] = True
-    return {"id": entry["id"]}
+        _save(sid, s)
+    return {"id": pid}
 
 
 @router.get("/api/capture/{sid}/photos/{pid}")
 def get_photo(sid: str, pid: str, x_capture_owner: str | None = Header(None)):
     s = _get(sid)
     _check(s, x_capture_owner, "owner")
-    p = next((p for p in s["photos"] if p["id"] == pid), None)
-    if not p:
+    if not any(p["id"] == pid for p in s["photos"]):
         raise HTTPException(404, "Photo not found")
-    return Response(p["data"], media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    res = store.file(_key(sid), f"photos/{pid}.jpg")
+    res.headers["Cache-Control"] = "no-store"
+    return res
 
 
 @router.delete("/api/capture/{sid}")
 def end_session(sid: str, x_capture_owner: str | None = Header(None)):
     s = _get(sid)
     _check(s, x_capture_owner, "owner")
-    with _lock:
-        _sessions.pop(sid, None)
+    store.delete(_key(sid))
     return {"ok": True}
