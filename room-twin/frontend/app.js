@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { LIBRARY } from './furniture.js';
+import { normalizeLayout, alignTwin, applyAlignment } from './scanmerge.js';
 
 THREE.Cache.enabled = true;
 const $ = (id) => document.getElementById(id);
@@ -165,6 +166,9 @@ const panoShader = {
 };
 let panoTexture = null;
 
+// Where the photos were taken from (moves when a LiDAR scan re-aligns the twin).
+const camXZ = (r, y) => [r.cameraPos?.[0] || 0, y, r.cameraPos?.[1] || 0];
+
 // Room box in world coordinates; the capture camera is at the origin, not necessarily the centre.
 function roomBox() {
   const r = project.room;
@@ -179,7 +183,7 @@ function buildRoom() {
   const usePano = $('photoWalls').checked && panoTexture;
   const wallMat = usePano
     ? new THREE.ShaderMaterial({ ...panoShader, side: THREE.BackSide,
-        uniforms: { pano: { value: panoTexture }, eye: { value: new THREE.Vector3(0, r.cameraHeight, 0) },
+        uniforms: { pano: { value: panoTexture }, eye: { value: new THREE.Vector3(...camXZ(r, r.cameraHeight)) },
           panoYaw: { value: r.panoYaw || 0 } } })
     : new THREE.MeshStandardMaterial({ color: r.wallColor, side: THREE.BackSide, roughness: 0.95 });
   const floorMat = usePano ? wallMat : new THREE.MeshStandardMaterial({ color: r.floorColor, side: THREE.BackSide, roughness: 0.9 });
@@ -208,7 +212,7 @@ function buildRoom() {
   // capture point marker
   const marker = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.2, 16), new THREE.MeshBasicMaterial({ color: 0x2f6f5e }));
   marker.rotation.x = Math.PI;
-  marker.position.set(0, r.cameraHeight, 0);
+  marker.position.set(...camXZ(r, r.cameraHeight));
   marker.name = 'camera-marker';
   roomGroup.add(marker);
   for (const [k, id] of [['width', 'rW'], ['depth', 'rD'], ['height', 'rH']]) $(id).value = r[k];
@@ -665,7 +669,7 @@ function addPrimitive(type, at) {
   const def = LIBRARY[type];
   const p = at || freeSpot(spawnPoint(), def.size[0], def.size[2]);
   const o = { id: newId(), label: type, kind: 'primitive', type, color: def.color, size: [...def.size],
-    position: [p.x, 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: 'floor' };
+    position: [p.x, def.elevation || 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: def.mount || 'floor' };
   addObject(o);
   keepInRoom(nodes.get(o.id), false);
   syncFromNode(o.id);
@@ -746,6 +750,87 @@ $('importGlb').onchange = async (e) => {
 for (const [id, key] of [['rW', 'width'], ['rD', 'depth'], ['rH', 'height']]) {
   $(id).onchange = (e) => { project.room[key] = Math.max(1, +e.target.value); buildRoom(); markDirty(); };
 }
+// ---------------------------------------------------------------- layout JSON (RoomShift format)
+// Shared with the RoomShift editor / its iPhone LiDAR (RoomPlan) exporter: metres, Y-up,
+// positions are box centres, rotation is radians about Y.
+async function importLayout(file) {
+  let scan;
+  try { scan = normalizeLayout(JSON.parse(await file.text())); } catch (err) { return toast(err.message || 'Not a valid layout file'); }
+  if (!project) await startBlank();
+  if (!project) return;
+  checkpoint();
+  const photoObjs = project.objects.filter((o) => o.kind !== 'primitive');
+  const fit = alignTwin(photoObjs, scan.objects);
+  const matched = new Set();
+  if (fit) {
+    applyAlignment(project, fit);
+    // snap each matched photo object onto its scanned box (exact position and size),
+    // keeping whichever of the box's four headings is closest to how the photo card faces
+    const taken = new Set();
+    for (const [p, sObj] of [...fit.pairs].sort((a, b) => (b[0].score || 0) - (a[0].score || 0))) {
+      if (taken.has(sObj.id) || matched.has(p.id)) continue;
+      taken.add(sObj.id);
+      matched.add(p.id);
+      let best = 0, bestErr = Infinity;
+      for (let k = 0; k < 4; k++) {
+        const r = sObj.rotation + (k * Math.PI) / 2;
+        const err = Math.abs(Math.atan2(Math.sin(r - p.rotationY), Math.cos(r - p.rotationY)));
+        if (err < bestErr) { bestErr = err; best = k; }
+      }
+      const [w, h, d] = sObj.dimensions;
+      p.size = best % 2 ? [d, h, w] : [w, h, d];
+      p.rotationY = sObj.rotation + (best * Math.PI) / 2;
+      p.position = [sObj.position[0], 0, sObj.position[2]];
+      p.scanMatched = true;
+    }
+    scan.objects = scan.objects.filter((o) => !taken.has(o.id));
+  } else if (photoObjs.length) {
+    toast('Could not match the scan to the photo twin automatically; showing the scan alongside it', 5000);
+  }
+  Object.assign(project.room, { width: +scan.room.width.toFixed(3), depth: +scan.room.depth.toFixed(3),
+    height: +scan.room.height.toFixed(3), center: scan.room.center, layout: 'scanned' });
+  const add = (item, mount, label) => {
+    const [w, h, d] = item.dimensions || [0.5, 0.5, 0.5];
+    const [x, y, z] = item.position || [0, h / 2, 0];
+    const type = LIBRARY[label] ? label : 'box';
+    project.objects.push({ id: newId(), label, kind: 'primitive', type, color: LIBRARY[type].color,
+      size: [w, h, d], position: [x, Math.max(0, y - h / 2), z], rotationY: item.rotation || 0,
+      scale: [1, 1, 1], mount, fromScan: true });
+  };
+  for (const o of scan.openings) add(o, 'wall', o.kind === 'window' ? 'window' : 'door');
+  for (const o of scan.objects) add(o, 'floor', o.label);
+  buildRoom();
+  rebuildObjects();
+  setView('pers');
+  markDirty();
+  toast(fit
+    ? `Scan merged: ${matched.size} photo objects snapped to it, camera height calibrated to ${project.room.cameraHeight} m`
+    : `Imported scan: ${scan.room.width.toFixed(2)} × ${scan.room.depth.toFixed(2)} m, ${scan.openings.length + scan.objects.length} items`, 6000);
+}
+
+function exportLayout() {
+  if (!project) return;
+  const r = project.room;
+  const [cx, cz] = r.center || [0, 0];
+  const items = project.objects.filter((o) => !o.hidden).map((o) => {
+    const size = (o.size || [0.5, 0.5, 0.5]).map((v, i) => +(v * (o.scale?.[i] ?? 1)).toFixed(3));
+    return { id: o.id, kind: o.type || o.label, dimensions: size,
+      position: [+(o.position[0] - cx).toFixed(3), +(o.position[1] + size[1] / 2).toFixed(3), +(o.position[2] - cz).toFixed(3)],
+      rotation: +(o.rotationY || 0).toFixed(4) };
+  });
+  const layout = { format: 'roomshift-layout', version: 1, units: 'meters', coordinateSystem: 'right-handed-y-up',
+    source: 'room-twin', room: { width: r.width, depth: r.depth, height: r.height },
+    surfaces: items.filter((i) => ['door', 'window'].includes(i.kind)),
+    objectLocations: items.filter((i) => !['door', 'window'].includes(i.kind)) };
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(layout, null, 1)], { type: 'application/json' }));
+  a.download = `${(project.name || 'room').replace(/\W+/g, '_')}.layout.json`;
+  a.click();
+}
+$('layoutFile').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) importLayout(f); };
+$('layoutFile2').onchange = $('layoutFile').onchange;
+$('layoutExport').onclick = exportLayout;
+
 $('rFloor').oninput = (e) => { project.room.floorColor = e.target.value; buildRoom(); markDirty(); };
 $('rWall').oninput = (e) => { project.room.wallColor = e.target.value; buildRoom(); markDirty(); };
 $('photoWalls').onchange = buildRoom;
@@ -771,7 +856,10 @@ function setView(kind) {
   const { cx, cz } = project ? roomBox() : { cx: 0, cz: 0 };
   const span = Math.max(r.width, r.depth);
   if (kind === 'top') { camera.position.set(cx, span * 1.6, cz + 0.001); orbit.target.set(cx, 0, cz); }
-  else if (kind === 'eye') { camera.position.set(0, r.cameraHeight, 0.01); orbit.target.set(0, r.cameraHeight, -0.5); }
+  else if (kind === 'eye') {
+    const [ex, ey, ez] = camXZ(r, r.cameraHeight);
+    camera.position.set(ex, ey, ez + 0.01); orbit.target.set(ex, ey, ez - 0.5);
+  }
   else { camera.position.set(cx + span * 0.9, span * 1.1, cz + span * 1.2); orbit.target.set(cx, 0.6, cz); }
   orbit.update();
 }
@@ -960,7 +1048,71 @@ function setFiles(files) {
   renderThumbs();
 }
 
+function addFiles(files) {
+  const list = [...files].filter((f) => f.type.startsWith('image/'));
+  pending.push(...list.map((f) => ({ file: f, url: URL.createObjectURL(f), yaw: 0 })));
+  pending.forEach((p, i) => (p.yaw = Math.round((i * 360) / pending.length))); // re-spread the defaults
+  renderThumbs();
+}
+
 $('files').onchange = (e) => setFiles(e.target.files);
+
+// ---------------------------------------------------------------- phone capture (QR pairing)
+let phone = null; // { id, owner, seen:Set, timer }
+
+async function startPhone() {
+  stopPhone();
+  try {
+    const s = await api('/api/capture', { method: 'POST' });
+    phone = { ...s, seen: new Set(), timer: null };
+    const qr = qrcode(0, 'M');
+    qr.addData(s.url);
+    qr.make();
+    $('qr').innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+    $('phoneLink').textContent = s.url.split('#')[0];
+    $('phoneLink').href = s.url;
+    $('phoneWarn').textContent = s.warning || '';
+    $('phoneWarn').classList.toggle('hidden', !s.warning);
+    $('phoneStatus').textContent = "Scan with your phone's camera";
+    $('phonePanel').classList.remove('hidden');
+    $('phoneBtn').classList.add('hidden');
+    phone.timer = setInterval(pollPhone, 1500);
+  } catch (err) { toast(`Couldn't start phone capture: ${err.message}`); }
+}
+
+async function pollPhone() {
+  if (!phone) return;
+  const headers = { 'X-Capture-Owner': phone.owner };
+  let state;
+  try { state = await api(`/api/capture/${phone.id}`, { headers }); }
+  catch (err) { toast(`Phone session ended: ${err.message}`); stopPhone(); return; }
+  const fresh = state.photos.filter((p) => !phone.seen.has(p.id));
+  fresh.forEach((p) => phone.seen.add(p.id));
+  const n = phone.seen.size;
+  $('phoneStatus').textContent = state.phone_connected
+    ? `📱 Phone connected · ${n} photo${n === 1 ? '' : 's'} received` : "Scan with your phone's camera";
+  for (const p of fresh) {
+    const r = await fetch(`/api/capture/${phone.id}/photos/${p.id}`, { headers });
+    if (!r.ok) continue;
+    const file = new File([await r.blob()], `phone-${p.id}.jpg`, { type: 'image/jpeg' });
+    if (p.mode === 'item' && project) addItemFromFile(file);
+    else {
+      addFiles([file]);
+      if (p.mode === 'item') toast('Open a room first to drop items in — added it to the photo list for now');
+    }
+  }
+}
+
+function stopPhone() {
+  if (!phone) return;
+  clearInterval(phone.timer);
+  fetch(`/api/capture/${phone.id}`, { method: 'DELETE', headers: { 'X-Capture-Owner': phone.owner } }).catch(() => {});
+  phone = null;
+  $('phonePanel').classList.add('hidden');
+  $('phoneBtn').classList.remove('hidden');
+}
+$('phoneBtn').onclick = startPhone;
+$('phoneEnd').onclick = stopPhone;
 $('mode').onchange = renderThumbs;
 const drop = $('drop');
 drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };

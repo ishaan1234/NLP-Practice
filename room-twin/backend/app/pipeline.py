@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "projects"
 PANO_CROP_YAWS = [i * 45 for i in range(8)]
+STRUCTURE = ["floor", "door", "window"]  # segmented to understand the room, not turned into objects
 PANO_CROP_PITCH = -20  # look down: furniture lives below the horizon
 # 120 x 108 deg crops: a bed 1.5 m away still fits in one view, and the floor is visible to ~0.4 m
 PANO_CROP_FOV = 120
@@ -196,7 +197,7 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         models = Models.load()
         write_status(pid, "preparing views", 0.08)
         views, pano = build_views(pid, inputs, mode, yaws, hfov, pitches)
-        prompts = [p for p in (prompts or DEFAULT_PROMPTS) if p != "floor"]
+        prompts = [p for p in (prompts or DEFAULT_PROMPTS) if p not in STRUCTURE]
         height = room[2]
 
         # 1. segment furniture + floor in every view
@@ -204,11 +205,22 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         floors: dict[str, np.ndarray] = {}
         for vi, view in enumerate(views):
             write_status(pid, f"segmenting {view.id} ({models.segmenter.name})", 0.1 + 0.5 * vi / len(views))
-            for det in models.segmenter.segment(view.image, prompts + ["floor"]):
+            # separate pass for structure: in a joint pass the detector gives each region one
+            # name, and a door then comes back as "wardrobe" instead of as a door
+            seg = models.segmenter
+            if hasattr(seg, "segment_with_structure"):
+                dets = seg.segment_with_structure(view.image, prompts, STRUCTURE)
+            else:
+                dets = seg.segment(view.image, prompts) + seg.segment(view.image, STRUCTURE)
+            # doors and windows get mistaken for wardrobes / cabinets / frames: drop those
+            openings = [d.mask for d in dets if d.label in ("door", "window")]
+            for det in dets:
                 if det.label in ("floor", "rug"):  # a rug is floor as far as the walls are concerned
                     floors[view.id] = floors.get(view.id, np.zeros_like(det.mask)) | det.mask
-                else:
-                    raw.append((view, det))
+                elif det.label not in STRUCTURE:
+                    area = det.mask.sum()
+                    if not any((det.mask & m).sum() > 0.6 * area for m in openings):
+                        raw.append((view, det))
 
         # 2. room orientation + walls from the floor outline; from here on work in the room's frame
         occluders = {}
@@ -237,15 +249,28 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
                 continue
             objects.append(_make_object(pid, pdir, view, det, pl))
 
-        # drop things seen through doorways (well past a wall we actually saw); grow for the rest
-        kept = []
-        for o in objects:
+        # An object whose floor contact is hidden (a nightstand behind a bed) reads as too far
+        # away. Past a wall we actually saw, slide it back along the line of sight (shrinking it
+        # in proportion: same angular size, closer) until it fits; drop it only if it is far
+        # outside (likely another room through a doorway). Unseen sides grow to fit instead.
+        fitted = Bounds(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z)
+        kept, far = [], 1.5
+
+        def overshoot(o):
             x0, x1, z0, z1 = _footprint(o)
-            outside = ((seen.get("min_x") and x1 < bounds.min_x - 0.3) or (seen.get("max_x") and x0 > bounds.max_x + 0.3)
-                       or (seen.get("min_z") and z1 < bounds.min_z - 0.3) or (seen.get("max_z") and z0 > bounds.max_z + 0.3))
-            if not outside:
-                kept.append(o)
-                bounds.include(x0, x1, z0, z1)
+            return max(seen.get("min_x") and fitted.min_x - x0 or 0, seen.get("max_x") and x1 - fitted.max_x or 0,
+                       seen.get("min_z") and fitted.min_z - z0 or 0, seen.get("max_z") and z1 - fitted.max_z or 0, 0)
+
+        for o in objects:
+            if overshoot(o) > far:
+                continue
+            for _ in range(40):
+                if overshoot(o) <= 0.02:
+                    break
+                o["position"] = [o["position"][0] * 0.96, o["position"][1], o["position"][2] * 0.96]
+                o["size"] = [v * 0.96 for v in o["size"]]
+            kept.append(o)
+            bounds.include(*_footprint(o))
         objects = kept
         for side, grow in (("x", 2.5), ("z", 2.5)):  # a room is at least ~2.5 m across
             lo, hi = getattr(bounds, f"min_{side}"), getattr(bounds, f"max_{side}")

@@ -47,6 +47,17 @@
           <input type="file" id="files" accept="image/*" multiple hidden />
           <span>Drop room photos or one 360° image<br /><small>or click to choose</small></span>
         </label>
+        <button id="phoneBtn" class="wide" title="Scan a QR code and take the photos with your phone">📱 Use phone camera</button>
+        <div id="phonePanel" class="phone hidden">
+          <div id="qr" class="qr"></div>
+          <div class="phone-info">
+            <b id="phoneStatus">Scan with your phone's camera</b>
+            <p class="muted small">Room photos land here; item photos go straight into the open room.</p>
+            <a id="phoneLink" class="muted small" target="_blank" rel="noreferrer"></a>
+            <p id="phoneWarn" class="warn small hidden"></p>
+            <button id="phoneEnd">Stop</button>
+          </div>
+        </div>
         <div id="thumbs" class="thumbs"></div>
         <div class="grid2">
           <label>Mode
@@ -77,6 +88,7 @@
         <div id="progress" class="progress hidden"><div class="bar"></div><span></span></div>
         <div class="or">or</div>
         <button id="blank" class="wide" title="An empty room you furnish from the library">Start a blank room</button>
+        <label class="btn wide" title="RoomShift / iPhone RoomPlan layout (.json)">Open a layout file…<input type="file" id="layoutFile2" accept=".json,application/json" hidden /></label>
       </section>
 
       <section>
@@ -171,6 +183,10 @@
           <label class="color-row">Floor<input type="color" id="rFloor" /></label>
           <label class="color-row">Walls<input type="color" id="rWall" /></label>
         </div>
+        <div class="row">
+          <label class="btn" title="RoomShift / iPhone RoomPlan layout (.json): walls, doors, windows, furniture boxes">Import layout…<input type="file" id="layoutFile" accept=".json,application/json" hidden /></label>
+          <button id="layoutExport" title="Save the room as layout JSON (opens in RoomShift)">Export layout</button>
+        </div>
       </section>
 
       <section>
@@ -180,6 +196,7 @@
     </aside>
   </main>
   <div id="toast" class="toast hidden"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

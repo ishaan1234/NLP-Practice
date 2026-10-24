@@ -25,6 +25,7 @@ class Sam3DReconstructor:
     def __init__(self):
         # The SAM 3D Objects repo ships its inference wrapper in notebook/inference.py.
         repo = Path(os.environ.get("SAM3D_REPO", "sam-3d-objects")).resolve()
+        sys.path.insert(0, str(repo))  # its notebook helpers import from the repo root too
         sys.path.insert(0, str(repo / "notebook"))
         from inference import Inference  # type: ignore
 
@@ -33,6 +34,8 @@ class Sam3DReconstructor:
 
     def reconstruct(self, image: Image.Image, mask: np.ndarray, out_stem: Path) -> tuple[str, Path] | None:
         out = self.model(np.asarray(image.convert("RGB")), mask.astype(bool), seed=42)
+        # output["glb"] is a trimesh already converted to Y-up (see RoomShift's worker), so it
+        # drops straight into the editor; its scale is a guess and gets fitted to our box.
         mesh = out.get("glb") if isinstance(out, dict) else None
         if mesh is not None and hasattr(mesh, "export"):
             path = out_stem.with_suffix(".glb")
