@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="referrer" content="no-referrer" />
+  <title>Room Twin · Phone</title>
+  <style>
+    :root { --bg: #f4f3ef; --panel: #fff; --ink: #1f2328; --muted: #6b7078; --line: #e2e0da; --accent: #2f6f5e; --accent-ink: #fff; --danger: #b4443a; --sel: #e8f1ee; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #15171a; --panel: #1d2024; --ink: #e7e7e4; --muted: #9198a1; --line: #2d3137; --accent: #5fb39b; --accent-ink: #0d1412; --danger: #e0786d; --sel: #23302c; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    main { max-width: 520px; margin: 0 auto; padding: 16px 16px calc(24px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 14px; }
+    h1 { font-size: 22px; margin: 4px 0 0; }
+    .muted { color: var(--muted); font-size: 14px; margin: 0; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+    .seg button { font: inherit; padding: 10px; border: 0; background: var(--panel); color: var(--ink); }
+    .seg button.on { background: var(--sel); color: var(--accent); font-weight: 600; }
+    .btn { display: flex; align-items: center; justify-content: center; gap: 8px; font: inherit; font-weight: 600; padding: 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+    .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .shot { position: relative; border-radius: 8px; overflow: hidden; background: var(--line); aspect-ratio: 1; }
+    .shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .shot span { position: absolute; left: 4px; bottom: 4px; font-size: 11px; padding: 1px 6px; border-radius: 8px; background: rgba(0,0,0,.6); color: #fff; }
+    .shot .bar { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--accent); transition: width .2s; }
+    .error { color: var(--danger); font-size: 14px; margin: 0; }
+    ol { margin: 0; padding-left: 20px; font-size: 14px; color: var(--muted); }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <div>
+      <h1>Room Twin</h1>
+      <p class="muted" id="status">Connecting to your computer…</p>
+    </div>
+    <div id="ended" class="card hidden">
+      <p class="error" id="endedMsg"></p>
+      <p class="muted">Press <b>Use phone</b> on your computer and scan the new code.</p>
+    </div>
+    <div id="app" class="hidden">
+      <div class="card">
+        <div class="seg">
+          <button id="mRoom" class="on">Room photos</button>
+          <button id="mItem">An item</button>
+        </div>
+        <ol id="tipsRoom">
+          <li>Stand in one spot near the middle of the room.</li>
+          <li>Turn a little between shots so they overlap; get the floor and walls in.</li>
+          <li>Or upload one 360° photo.</li>
+        </ol>
+        <ol id="tipsItem" class="hidden">
+          <li>Frame one piece of furniture, whole, on a plain-ish background.</li>
+          <li>It appears in your room on the computer, ready to move.</li>
+        </ol>
+        <label class="btn primary">📷 Take photo<input id="cam" type="file" accept="image/*" capture="environment" hidden /></label>
+        <label class="btn">🖼️ Choose from gallery<input id="gal" type="file" accept="image/*" multiple hidden /></label>
+        <p class="error" id="err"></p>
+      </div>
+      <div class="card">
+        <p class="muted" id="count">No photos sent yet.</p>
+        <div id="shots" class="grid"></div>
+      </div>
+    </div>
+  </main>
+  <script>
+    // Session id and upload secret live in the URL fragment, so they never reach server logs.
+    const [sid, secret] = location.hash.slice(1).split('.');
+    history.replaceState(null, '', location.pathname);
+    const $ = (id) => document.getElementById(id);
+    let mode = 'room', sent = 0;
+
+    function ended(msg) {
+      $('app').classList.add('hidden');
+      $('ended').classList.remove('hidden');
+      $('endedMsg').textContent = msg;
+      $('status').textContent = 'Not connected';
+    }
+
+    async function checkIn() {
+      if (!sid || !secret) return ended('This link is incomplete.');
+      try {
+        const r = await fetch(`/api/capture/${sid}`, { headers: { 'X-Capture-Phone': secret } });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || 'Session not found');
+        $('status').textContent = 'Connected — photos go straight to your computer.';
+        $('app').classList.remove('hidden');
+      } catch (e) { ended(e.message); }
+    }
+
+    function setMode(m) {
+      mode = m;
+      $('mRoom').classList.toggle('on', m === 'room');
+      $('mItem').classList.toggle('on', m === 'item');
+      $('tipsRoom').classList.toggle('hidden', m !== 'room');
+      $('tipsItem').classList.toggle('hidden', m !== 'item');
+    }
+    $('mRoom').onclick = () => setMode('room');
+    $('mItem').onclick = () => setMode('item');
+
+    function upload(file) {
+      const tile = document.createElement('div');
+      tile.className = 'shot';
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      const tag = document.createElement('span');
+      tag.textContent = mode === 'room' ? 'room · sending' : 'item · sending';
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      bar.style.width = '0%';
+      tile.append(img, tag, bar);
+      $('shots').prepend(tile);
+      const thisMode = mode;
+      return new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `/api/capture/${sid}/photos`);
+        xhr.setRequestHeader('X-Capture-Phone', secret);
+        xhr.upload.onprogress = (e) => { if (e.lengthComputable) bar.style.width = `${(e.loaded / e.total) * 100}%`; };
+        xhr.onload = () => {
+          if (xhr.status < 300) {
+            tag.textContent = `${thisMode} · sent ✓`;
+            bar.remove();
+            $('count').textContent = `${++sent} photo${sent === 1 ? '' : 's'} sent.`;
+          } else {
+            let msg = 'Upload failed';
+            try { msg = JSON.parse(xhr.responseText).detail || msg; } catch {}
+            tag.textContent = 'failed';
+            $('err').textContent = msg;
+            if (xhr.status === 410) ended(msg);
+          }
+          resolve();
+        };
+        xhr.onerror = () => { tag.textContent = 'failed'; $('err').textContent = 'Connection lost. Try again.'; resolve(); };
+        const fd = new FormData();
+        fd.append('photo', file, file.name || 'photo.jpg');
+        fd.append('mode', thisMode);
+        xhr.send(fd);
+      });
+    }
+
+    async function onFiles(e) {
+      $('err').textContent = '';
+      const files = [...e.target.files];
+      e.target.value = '';
+      for (const f of files) await upload(f); // one at a time keeps phones on weak Wi-Fi happy
+    }
+    $('cam').onchange = onFiles;
+    $('gal').onchange = onFiles;
+    checkIn();
+  </script>
+</body>
+</html>

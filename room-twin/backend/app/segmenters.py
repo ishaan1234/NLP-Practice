@@ -38,12 +38,18 @@ def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(inter / np.logical_or(a, b).sum())
 
 
+STRUCTURE_LABELS = {"floor", "rug", "door", "window"}
+
+
 def nms(dets: list[Detection], iou_thr: float = 0.5) -> list[Detection]:
+    """Drop overlapping duplicates. Room structure (floor, doors, ...) never competes with
+    furniture: the pipeline needs both a door's mask and the wardrobe it was mistaken for."""
+    structure = [d for d in dets if d.label in STRUCTURE_LABELS]
     keep: list[Detection] = []
-    for d in sorted(dets, key=lambda d: d.score, reverse=True):
+    for d in sorted((d for d in dets if d.label not in STRUCTURE_LABELS), key=lambda d: d.score, reverse=True):
         if all(mask_iou(d.mask, k.mask) < iou_thr for k in keep):
             keep.append(d)
-    return keep
+    return keep + structure
 
 
 class Sam3Segmenter:

@@ -665,7 +665,7 @@ function addPrimitive(type, at) {
   const def = LIBRARY[type];
   const p = at || freeSpot(spawnPoint(), def.size[0], def.size[2]);
   const o = { id: newId(), label: type, kind: 'primitive', type, color: def.color, size: [...def.size],
-    position: [p.x, 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: 'floor' };
+    position: [p.x, def.elevation || 0, p.z], rotationY: 0, scale: [1, 1, 1], mount: def.mount || 'floor' };
   addObject(o);
   keepInRoom(nodes.get(o.id), false);
   syncFromNode(o.id);
@@ -746,6 +746,58 @@ $('importGlb').onchange = async (e) => {
 for (const [id, key] of [['rW', 'width'], ['rD', 'depth'], ['rH', 'height']]) {
   $(id).onchange = (e) => { project.room[key] = Math.max(1, +e.target.value); buildRoom(); markDirty(); };
 }
+// ---------------------------------------------------------------- layout JSON (RoomShift format)
+// Shared with the RoomShift editor / its iPhone LiDAR (RoomPlan) exporter: metres, Y-up,
+// positions are box centres, rotation is radians about Y.
+async function importLayout(file) {
+  let j;
+  try { j = JSON.parse(await file.text()); } catch { return toast('That file is not valid JSON'); }
+  if (j.format !== 'roomshift-layout' || !j.room) return toast('Expected a roomshift-layout JSON file');
+  if (!project) await startBlank();
+  if (!project) return;
+  checkpoint();
+  Object.assign(project.room, { width: +j.room.width || 5, depth: +j.room.depth || 4, height: +j.room.height || 2.7, center: [0, 0] });
+  const add = (item, mount) => {
+    const [w, h, d] = item.dimensions || [0.5, 0.5, 0.5];
+    const [x, y, z] = item.position || [0, h / 2, 0];
+    const type = LIBRARY[item.kind] ? item.kind : 'box';
+    project.objects.push({ id: newId(), label: item.kind || 'object', kind: 'primitive', type,
+      color: LIBRARY[type].color, size: [w, h, d], position: [x, Math.max(0, y - h / 2), z],
+      rotationY: item.rotation || 0, scale: [1, 1, 1], mount });
+  };
+  const openings = (j.surfaces || []).filter((x) => ['door', 'window', 'opening'].includes(x.kind));
+  for (const x of openings) add({ ...x, kind: x.kind === 'opening' ? 'door' : x.kind }, 'wall');
+  for (const o of j.objectLocations || []) add(o, 'floor');
+  buildRoom();
+  rebuildObjects();
+  setView('pers');
+  markDirty();
+  toast(`Imported layout: ${j.room.width} × ${j.room.depth} m, ${openings.length + (j.objectLocations || []).length} items`);
+}
+
+function exportLayout() {
+  if (!project) return;
+  const r = project.room;
+  const [cx, cz] = r.center || [0, 0];
+  const items = project.objects.filter((o) => !o.hidden).map((o) => {
+    const size = (o.size || [0.5, 0.5, 0.5]).map((v, i) => +(v * (o.scale?.[i] ?? 1)).toFixed(3));
+    return { id: o.id, kind: o.type || o.label, dimensions: size,
+      position: [+(o.position[0] - cx).toFixed(3), +(o.position[1] + size[1] / 2).toFixed(3), +(o.position[2] - cz).toFixed(3)],
+      rotation: +(o.rotationY || 0).toFixed(4) };
+  });
+  const layout = { format: 'roomshift-layout', version: 1, units: 'meters', coordinateSystem: 'right-handed-y-up',
+    source: 'room-twin', room: { width: r.width, depth: r.depth, height: r.height },
+    surfaces: items.filter((i) => ['door', 'window'].includes(i.kind)),
+    objectLocations: items.filter((i) => !['door', 'window'].includes(i.kind)) };
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(layout, null, 1)], { type: 'application/json' }));
+  a.download = `${(project.name || 'room').replace(/\W+/g, '_')}.layout.json`;
+  a.click();
+}
+$('layoutFile').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) importLayout(f); };
+$('layoutFile2').onchange = $('layoutFile').onchange;
+$('layoutExport').onclick = exportLayout;
+
 $('rFloor').oninput = (e) => { project.room.floorColor = e.target.value; buildRoom(); markDirty(); };
 $('rWall').oninput = (e) => { project.room.wallColor = e.target.value; buildRoom(); markDirty(); };
 $('photoWalls').onchange = buildRoom;
@@ -960,7 +1012,71 @@ function setFiles(files) {
   renderThumbs();
 }
 
+function addFiles(files) {
+  const list = [...files].filter((f) => f.type.startsWith('image/'));
+  pending.push(...list.map((f) => ({ file: f, url: URL.createObjectURL(f), yaw: 0 })));
+  pending.forEach((p, i) => (p.yaw = Math.round((i * 360) / pending.length))); // re-spread the defaults
+  renderThumbs();
+}
+
 $('files').onchange = (e) => setFiles(e.target.files);
+
+// ---------------------------------------------------------------- phone capture (QR pairing)
+let phone = null; // { id, owner, seen:Set, timer }
+
+async function startPhone() {
+  stopPhone();
+  try {
+    const s = await api('/api/capture', { method: 'POST' });
+    phone = { ...s, seen: new Set(), timer: null };
+    const qr = qrcode(0, 'M');
+    qr.addData(s.url);
+    qr.make();
+    $('qr').innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+    $('phoneLink').textContent = s.url.split('#')[0];
+    $('phoneLink').href = s.url;
+    $('phoneWarn').textContent = s.warning || '';
+    $('phoneWarn').classList.toggle('hidden', !s.warning);
+    $('phoneStatus').textContent = "Scan with your phone's camera";
+    $('phonePanel').classList.remove('hidden');
+    $('phoneBtn').classList.add('hidden');
+    phone.timer = setInterval(pollPhone, 1500);
+  } catch (err) { toast(`Couldn't start phone capture: ${err.message}`); }
+}
+
+async function pollPhone() {
+  if (!phone) return;
+  const headers = { 'X-Capture-Owner': phone.owner };
+  let state;
+  try { state = await api(`/api/capture/${phone.id}`, { headers }); }
+  catch (err) { toast(`Phone session ended: ${err.message}`); stopPhone(); return; }
+  const fresh = state.photos.filter((p) => !phone.seen.has(p.id));
+  fresh.forEach((p) => phone.seen.add(p.id));
+  const n = phone.seen.size;
+  $('phoneStatus').textContent = state.phone_connected
+    ? `📱 Phone connected · ${n} photo${n === 1 ? '' : 's'} received` : "Scan with your phone's camera";
+  for (const p of fresh) {
+    const r = await fetch(`/api/capture/${phone.id}/photos/${p.id}`, { headers });
+    if (!r.ok) continue;
+    const file = new File([await r.blob()], `phone-${p.id}.jpg`, { type: 'image/jpeg' });
+    if (p.mode === 'item' && project) addItemFromFile(file);
+    else {
+      addFiles([file]);
+      if (p.mode === 'item') toast('Open a room first to drop items in — added it to the photo list for now');
+    }
+  }
+}
+
+function stopPhone() {
+  if (!phone) return;
+  clearInterval(phone.timer);
+  fetch(`/api/capture/${phone.id}`, { method: 'DELETE', headers: { 'X-Capture-Owner': phone.owner } }).catch(() => {});
+  phone = null;
+  $('phonePanel').classList.add('hidden');
+  $('phoneBtn').classList.remove('hidden');
+}
+$('phoneBtn').onclick = startPhone;
+$('phoneEnd').onclick = stopPhone;
 $('mode').onchange = renderThumbs;
 const drop = $('drop');
 drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };

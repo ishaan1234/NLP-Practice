@@ -114,6 +114,21 @@ export const LIBRARY = {
     g.add(r);
     return g;
   } },
+  door: { icon: '🚪', color: '#9a7b5f', size: [0.9, 2.1, 0.06], mount: 'wall', build(c) {
+    const g = new THREE.Group(), m = mat(c, 0.6);
+    g.add(box(0.9, 2.1, 0.04, m));
+    const frame = mat('#e8e4dc', 0.7);
+    g.add(box(0.05, 2.15, 0.06, frame, -0.47, 0, 0), box(0.05, 2.15, 0.06, frame, 0.47, 0, 0), box(0.99, 0.05, 0.06, frame, 0, 2.1, 0));
+    g.add(cyl(0.025, 0.025, 0.02, mat('#c9a44c', 0.3), 0.35, 1.0, 0.03, 12).rotateX(Math.PI / 2));
+    return g;
+  } },
+  window: { icon: '🪟', color: '#bcd6e6', size: [1.2, 1.2, 0.06], mount: 'wall', elevation: 0.9, build(c) {
+    const g = new THREE.Group(), frame = mat('#f2f0ea', 0.6);
+    g.add(box(1.2, 1.2, 0.02, new THREE.MeshStandardMaterial({ color: c, roughness: 0.1, transparent: true, opacity: 0.45 })));
+    g.add(box(1.2, 0.05, 0.06, frame, 0, 0, 0), box(1.2, 0.05, 0.06, frame, 0, 1.15, 0));
+    g.add(box(0.05, 1.2, 0.06, frame, -0.575, 0, 0), box(0.05, 1.2, 0.06, frame, 0.575, 0, 0), box(0.04, 1.2, 0.06, frame, 0, 0, 0));
+    return g;
+  } },
   box: { icon: '📦', color: '#c8a46e', size: [0.5, 0.5, 0.5], build(c) {
     const g = new THREE.Group();
     g.add(box(0.5, 0.5, 0.5, mat(c)));

@@ -18,6 +18,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .capture import router as capture_router, sanitize_image
 from .pipeline import DATA_DIR, Models, make_item_from_photo, project_dir, run_pipeline, write_status
 
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +27,7 @@ ALLOWED = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 PID_RE = re.compile(r"^[a-f0-9]{12}$")
 
 app = FastAPI(title="Room Twin")
+app.include_router(capture_router)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -39,12 +41,12 @@ def _pdir(pid: str) -> Path:
 
 
 def _save_upload(f: UploadFile, dest_dir: Path, stem: str) -> Path:
+    """Store an uploaded photo re-encoded as JPEG (metadata stripped except lens focal length)."""
     ext = Path(f.filename or "").suffix.lower()
     if ext not in ALLOWED:
         raise HTTPException(400, f"unsupported file type: {f.filename}")
-    dest = dest_dir / f"{stem}{ext}"
-    with open(dest, "wb") as out:
-        shutil.copyfileobj(f.file, out)
+    dest = dest_dir / f"{stem}.jpg"
+    dest.write_bytes(sanitize_image(f.file.read()))
     return dest
 
 

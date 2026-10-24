@@ -155,3 +155,11 @@ button.wide { width: 100%; padding: 8px; }
 .thumbs .dir select { font-size: 11px; padding: 2px; }
 #viewport canvas.grab { cursor: grab; }
 #viewport canvas.grabbing { cursor: grabbing; }
+
+/* ---- phone capture ---- */
+.phone { display: flex; gap: 10px; align-items: flex-start; border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+.qr { flex: 0 0 116px; width: 116px; height: 116px; background: #fff; border-radius: 6px; padding: 4px; }
+.qr svg, .qr img { width: 100%; height: 100%; display: block; }
+.phone-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.phone-info a { overflow-wrap: anywhere; }
+.warn { color: var(--muted); margin: 0; }

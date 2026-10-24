@@ -64,6 +64,23 @@ keeps going with the fallback.
 
 ## Using it
 
+### Take the photos with your phone
+
+Press **📱 Use phone camera** and scan the QR code. On the phone, pick **Room photos** or
+**An item**, then take or choose photos; they appear on the computer within a couple of seconds
+(room photos in the upload list, items straight into the open room).
+
+The phone has to reach the computer: same Wi-Fi, and start the server so it listens on the
+network:
+
+```bash
+uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000
+```
+
+If the QR shows the wrong address (VPNs, several network cards), set `PUBLIC_URL=http://<ip>:8000`.
+The link's secret sits after `#`, so it never reaches server logs; a session lasts an hour, and
+**Stop** ends it immediately.
+
 1. **New twin** – drop photos or one 360° image. Mode `auto` treats a ~2:1 image as a panorama.
    For multiple photos, pick which way each one faces compared to the first (ahead / right /
    behind / left …; the arrow under each thumbnail shows it). The default spreads them evenly. Stand in one spot, roughly in the middle of the room, and turn.
@@ -83,6 +100,17 @@ keeps going with the fallback.
    spot. Drop or paste (`Ctrl+V`) any product photo onto the 3D view to cut it out and build it
    in 3D, or use **Import .glb…** for an existing model.
 5. **Save** (it also autosaves), **Export GLB** for Blender / Unity, **Screenshot** for a PNG.
+6. **Layouts** – *Import layout* / *Export layout* (Room panel) read and write the
+   `roomshift-layout` JSON used by RoomShift and its iPhone LiDAR (RoomPlan) exporter:
+   exact room size, doors, windows and furniture boxes. Doors and windows are also in the
+   library.
+
+### Uploads
+
+Every uploaded photo is decoded, turned upright, size-limited (15 MB, 40 MP; 2560 px, or 6144 px
+for 360° images) and re-saved as JPEG with its metadata (GPS, device info) removed – except the
+lens focal length, which is needed for distances.
+
 
 ## How it works
 
@@ -117,18 +145,26 @@ The capture camera is at `(0, camera_height, 0)` with the floor at `y = 0`.
   Gaussian splats are shown as coloured point clouds.
 - The fallback segmenter is only a demo of the flow; it labels everything "object".
 
+## Credits
+
+Phone pairing via QR, upload hardening, the layout JSON format and the SAM 3D output handling
+follow ideas from [RoomShift](https://github.com/tysuprawee/qr).
+
 ## Layout
 
 ```
 room-twin/
   backend/app/
     main.py            FastAPI routes + serves the frontend and project files
+    capture.py         QR phone capture sessions + upload sanitising
+    layout.py          room outline fitting, furniture size priors
     pipeline.py        upload → views → segment → place → reconstruct → scene.json
     geometry.py        camera model, 360→perspective resampling, mask → 3D placement
     segmenters.py      SAM 3 adapter + fallback segmenter
     reconstructors.py  SAM 3D Objects adapter + splat→point-cloud conversion
   frontend/
     index.html, style.css, app.js   Three.js editor
+    capture.html                    phone capture page
     furniture.js                    procedural furniture library
   data/projects/<id>/  uploads, views, cutouts, meshes, scene.json (gitignored)
 ```
