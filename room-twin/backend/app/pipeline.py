@@ -207,7 +207,11 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
             write_status(pid, f"segmenting {view.id} ({models.segmenter.name})", 0.1 + 0.5 * vi / len(views))
             # separate pass for structure: in a joint pass the detector gives each region one
             # name, and a door then comes back as "wardrobe" instead of as a door
-            dets = models.segmenter.segment(view.image, prompts) + models.segmenter.segment(view.image, STRUCTURE)
+            seg = models.segmenter
+            if hasattr(seg, "segment_with_structure"):
+                dets = seg.segment_with_structure(view.image, prompts, STRUCTURE)
+            else:
+                dets = seg.segment(view.image, prompts) + seg.segment(view.image, STRUCTURE)
             # doors and windows get mistaken for wardrobes / cabinets / frames: drop those
             openings = [d.mask for d in dets if d.label in ("door", "window")]
             for det in dets:
@@ -245,16 +249,28 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
                 continue
             objects.append(_make_object(pid, pdir, view, det, pl))
 
-        # drop only things far past a wall we actually saw (another room through a doorway);
-        # a missed real object is worse than an extra one the user can delete, so grow for the rest
+        # An object whose floor contact is hidden (a nightstand behind a bed) reads as too far
+        # away. Past a wall we actually saw, slide it back along the line of sight (shrinking it
+        # in proportion: same angular size, closer) until it fits; drop it only if it is far
+        # outside (likely another room through a doorway). Unseen sides grow to fit instead.
+        fitted = Bounds(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z)
         kept, far = [], 1.5
-        for o in objects:
+
+        def overshoot(o):
             x0, x1, z0, z1 = _footprint(o)
-            outside = ((seen.get("min_x") and x1 < bounds.min_x - far) or (seen.get("max_x") and x0 > bounds.max_x + far)
-                       or (seen.get("min_z") and z1 < bounds.min_z - far) or (seen.get("max_z") and z0 > bounds.max_z + far))
-            if not outside:
-                kept.append(o)
-                bounds.include(x0, x1, z0, z1)
+            return max(seen.get("min_x") and fitted.min_x - x0 or 0, seen.get("max_x") and x1 - fitted.max_x or 0,
+                       seen.get("min_z") and fitted.min_z - z0 or 0, seen.get("max_z") and z1 - fitted.max_z or 0, 0)
+
+        for o in objects:
+            if overshoot(o) > far:
+                continue
+            for _ in range(40):
+                if overshoot(o) <= 0.02:
+                    break
+                o["position"] = [o["position"][0] * 0.96, o["position"][1], o["position"][2] * 0.96]
+                o["size"] = [v * 0.96 for v in o["size"]]
+            kept.append(o)
+            bounds.include(*_footprint(o))
         objects = kept
         for side, grow in (("x", 2.5), ("z", 2.5)):  # a room is at least ~2.5 m across
             lo, hi = getattr(bounds, f"min_{side}"), getattr(bounds, f"max_{side}")

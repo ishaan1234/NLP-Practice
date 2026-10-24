@@ -39,7 +39,7 @@ and objects appear as photo cut-out cards. The header shows which backends a sce
 | Backend | Needs | Notes |
 |---|---|---|
 | **SAM 3** | GPU, gated checkpoint | best masks, text-prompted |
-| **Grounding DINO + SAM** | `pip install torch transformers` | ungated, runs on CPU (~15–40 s per image) |
+| **Grounding DINO + SAM** | `pip install torch transformers` | ungated, runs on CPU (~15 s per view on 4 cores; a 360° photo is 8 views); first run downloads ~1 GB of weights |
 | colour-region fallback | nothing | demo only, labels everything "object", can't measure walls |
 
 Force one with `ROOM_TWIN_SEGMENTER=sam3|grounded-sam|fallback`.
@@ -104,6 +104,25 @@ The link's secret sits after `#`, so it never reaches server logs; a session las
    `roomshift-layout` JSON used by RoomShift and its iPhone LiDAR (RoomPlan) exporter:
    exact room size, doors, windows and furniture boxes. Doors and windows are also in the
    library.
+
+### LiDAR scan + photos (Apple RoomPlan)
+
+On an iPhone/iPad **Pro** (LiDAR), Apple's RoomPlan measures walls, doors, windows and
+furniture boxes to within a few centimetres – but only as grey boxes. RoomShift's
+`native/RoomShiftRoomPlan` Swift package (build it into an iOS app with Xcode) exports that scan
+as `roomshift-layout.json`. Importing it into a **photo twin** merges the two
+(`frontend/scanmerge.js`):
+
+- the scan is straightened so its walls run along the axes (RoomPlan's frame starts wherever the
+  phone pointed),
+- the photo twin is matched onto it: 4 quarter turns × scale × offsets proposed by pairs of
+  same-type objects, then a least-squares refinement,
+- matched photo objects snap onto their scanned boxes (exact position and size), scanned pieces
+  without a photo come in as boxes, and the room takes the scan's exact size, doors and windows,
+- the scale also **calibrates the camera height**, so the 360° projection stays lined up.
+
+On a synthetic test (scan rotated 37°, quarter turn, scale 1.12, ±8 cm noise) it recovers the
+rotation exactly, the scale to 1.12 and places objects within the noise (6 cm median).
 
 ### Uploads
 

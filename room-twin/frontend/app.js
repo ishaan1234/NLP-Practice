@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { LIBRARY } from './furniture.js';
+import { normalizeLayout, alignTwin, applyAlignment } from './scanmerge.js';
 
 THREE.Cache.enabled = true;
 const $ = (id) => document.getElementById(id);
@@ -165,6 +166,9 @@ const panoShader = {
 };
 let panoTexture = null;
 
+// Where the photos were taken from (moves when a LiDAR scan re-aligns the twin).
+const camXZ = (r, y) => [r.cameraPos?.[0] || 0, y, r.cameraPos?.[1] || 0];
+
 // Room box in world coordinates; the capture camera is at the origin, not necessarily the centre.
 function roomBox() {
   const r = project.room;
@@ -179,7 +183,7 @@ function buildRoom() {
   const usePano = $('photoWalls').checked && panoTexture;
   const wallMat = usePano
     ? new THREE.ShaderMaterial({ ...panoShader, side: THREE.BackSide,
-        uniforms: { pano: { value: panoTexture }, eye: { value: new THREE.Vector3(0, r.cameraHeight, 0) },
+        uniforms: { pano: { value: panoTexture }, eye: { value: new THREE.Vector3(...camXZ(r, r.cameraHeight)) },
           panoYaw: { value: r.panoYaw || 0 } } })
     : new THREE.MeshStandardMaterial({ color: r.wallColor, side: THREE.BackSide, roughness: 0.95 });
   const floorMat = usePano ? wallMat : new THREE.MeshStandardMaterial({ color: r.floorColor, side: THREE.BackSide, roughness: 0.9 });
@@ -208,7 +212,7 @@ function buildRoom() {
   // capture point marker
   const marker = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.2, 16), new THREE.MeshBasicMaterial({ color: 0x2f6f5e }));
   marker.rotation.x = Math.PI;
-  marker.position.set(0, r.cameraHeight, 0);
+  marker.position.set(...camXZ(r, r.cameraHeight));
   marker.name = 'camera-marker';
   roomGroup.add(marker);
   for (const [k, id] of [['width', 'rW'], ['depth', 'rD'], ['height', 'rH']]) $(id).value = r[k];
@@ -750,29 +754,58 @@ for (const [id, key] of [['rW', 'width'], ['rD', 'depth'], ['rH', 'height']]) {
 // Shared with the RoomShift editor / its iPhone LiDAR (RoomPlan) exporter: metres, Y-up,
 // positions are box centres, rotation is radians about Y.
 async function importLayout(file) {
-  let j;
-  try { j = JSON.parse(await file.text()); } catch { return toast('That file is not valid JSON'); }
-  if (j.format !== 'roomshift-layout' || !j.room) return toast('Expected a roomshift-layout JSON file');
+  let scan;
+  try { scan = normalizeLayout(JSON.parse(await file.text())); } catch (err) { return toast(err.message || 'Not a valid layout file'); }
   if (!project) await startBlank();
   if (!project) return;
   checkpoint();
-  Object.assign(project.room, { width: +j.room.width || 5, depth: +j.room.depth || 4, height: +j.room.height || 2.7, center: [0, 0] });
-  const add = (item, mount) => {
+  const photoObjs = project.objects.filter((o) => o.kind !== 'primitive');
+  const fit = alignTwin(photoObjs, scan.objects);
+  const matched = new Set();
+  if (fit) {
+    applyAlignment(project, fit);
+    // snap each matched photo object onto its scanned box (exact position and size),
+    // keeping whichever of the box's four headings is closest to how the photo card faces
+    const taken = new Set();
+    for (const [p, sObj] of [...fit.pairs].sort((a, b) => (b[0].score || 0) - (a[0].score || 0))) {
+      if (taken.has(sObj.id) || matched.has(p.id)) continue;
+      taken.add(sObj.id);
+      matched.add(p.id);
+      let best = 0, bestErr = Infinity;
+      for (let k = 0; k < 4; k++) {
+        const r = sObj.rotation + (k * Math.PI) / 2;
+        const err = Math.abs(Math.atan2(Math.sin(r - p.rotationY), Math.cos(r - p.rotationY)));
+        if (err < bestErr) { bestErr = err; best = k; }
+      }
+      const [w, h, d] = sObj.dimensions;
+      p.size = best % 2 ? [d, h, w] : [w, h, d];
+      p.rotationY = sObj.rotation + (best * Math.PI) / 2;
+      p.position = [sObj.position[0], 0, sObj.position[2]];
+      p.scanMatched = true;
+    }
+    scan.objects = scan.objects.filter((o) => !taken.has(o.id));
+  } else if (photoObjs.length) {
+    toast('Could not match the scan to the photo twin automatically; showing the scan alongside it', 5000);
+  }
+  Object.assign(project.room, { width: +scan.room.width.toFixed(3), depth: +scan.room.depth.toFixed(3),
+    height: +scan.room.height.toFixed(3), center: scan.room.center, layout: 'scanned' });
+  const add = (item, mount, label) => {
     const [w, h, d] = item.dimensions || [0.5, 0.5, 0.5];
     const [x, y, z] = item.position || [0, h / 2, 0];
-    const type = LIBRARY[item.kind] ? item.kind : 'box';
-    project.objects.push({ id: newId(), label: item.kind || 'object', kind: 'primitive', type,
-      color: LIBRARY[type].color, size: [w, h, d], position: [x, Math.max(0, y - h / 2), z],
-      rotationY: item.rotation || 0, scale: [1, 1, 1], mount });
+    const type = LIBRARY[label] ? label : 'box';
+    project.objects.push({ id: newId(), label, kind: 'primitive', type, color: LIBRARY[type].color,
+      size: [w, h, d], position: [x, Math.max(0, y - h / 2), z], rotationY: item.rotation || 0,
+      scale: [1, 1, 1], mount, fromScan: true });
   };
-  const openings = (j.surfaces || []).filter((x) => ['door', 'window', 'opening'].includes(x.kind));
-  for (const x of openings) add({ ...x, kind: x.kind === 'opening' ? 'door' : x.kind }, 'wall');
-  for (const o of j.objectLocations || []) add(o, 'floor');
+  for (const o of scan.openings) add(o, 'wall', o.kind === 'window' ? 'window' : 'door');
+  for (const o of scan.objects) add(o, 'floor', o.label);
   buildRoom();
   rebuildObjects();
   setView('pers');
   markDirty();
-  toast(`Imported layout: ${j.room.width} × ${j.room.depth} m, ${openings.length + (j.objectLocations || []).length} items`);
+  toast(fit
+    ? `Scan merged: ${matched.size} photo objects snapped to it, camera height calibrated to ${project.room.cameraHeight} m`
+    : `Imported scan: ${scan.room.width.toFixed(2)} × ${scan.room.depth.toFixed(2)} m, ${scan.openings.length + scan.objects.length} items`, 6000);
 }
 
 function exportLayout() {
@@ -823,7 +856,10 @@ function setView(kind) {
   const { cx, cz } = project ? roomBox() : { cx: 0, cz: 0 };
   const span = Math.max(r.width, r.depth);
   if (kind === 'top') { camera.position.set(cx, span * 1.6, cz + 0.001); orbit.target.set(cx, 0, cz); }
-  else if (kind === 'eye') { camera.position.set(0, r.cameraHeight, 0.01); orbit.target.set(0, r.cameraHeight, -0.5); }
+  else if (kind === 'eye') {
+    const [ex, ey, ez] = camXZ(r, r.cameraHeight);
+    camera.position.set(ex, ey, ez + 0.01); orbit.target.set(ex, ey, ez - 0.5);
+  }
   else { camera.position.set(cx + span * 0.9, span * 1.1, cz + span * 1.2); orbit.target.set(cx, 0.6, cz); }
   orbit.update();
 }
