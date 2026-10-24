@@ -20,8 +20,10 @@ log = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "projects"
 PANO_CROP_YAWS = [i * 45 for i in range(8)]
-PANO_CROP_PITCH = -15  # look slightly down: furniture lives below the horizon
-PANO_CROP_FOV = 90
+PANO_CROP_PITCH = -20  # look down: furniture lives below the horizon
+# 120 x 108 deg crops: a bed 1.5 m away still fits in one view, and the floor is visible to ~0.4 m
+PANO_CROP_FOV = 120
+PANO_CROP_SIZE = (1280, 1024)
 
 
 class Models:
@@ -80,7 +82,7 @@ def build_views(pid: str, inputs: list[Path], mode: str, yaws_deg: list[float] |
             pano = pano.resize((4096, 2048), Image.LANCZOS)
         for yaw in PANO_CROP_YAWS:
             crop = equirect_to_perspective(pano, math.radians(yaw), math.radians(PANO_CROP_PITCH),
-                                           math.radians(PANO_CROP_FOV))
+                                           math.radians(PANO_CROP_FOV), *PANO_CROP_SIZE)
             views.append(View(f"pano_{yaw:03d}", crop, math.radians(yaw), math.radians(PANO_CROP_PITCH),
                               math.radians(PANO_CROP_FOV), "pano-crop", rel(pid, inputs[pano_idx])))
         return views, rel(pid, inputs[pano_idx])
@@ -110,21 +112,47 @@ def save_cutout(view: View, det: Detection, path: Path) -> list[int]:
     return [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
 
 
+# Labels a detector mixes up for the same piece of furniture.
+CONFUSABLE = [{"desk", "table", "cabinet", "nightstand", "shelf", "wardrobe"},
+              {"chair", "armchair", "stool", "ottoman", "bench"},
+              {"sofa", "armchair", "bed", "bench"}, {"tv", "monitor", "picture frame", "mirror"}]
+
+
+def _same_kind(a: str, b: str) -> bool:
+    return a == b or "object" in (a, b) or any(a in g and b in g for g in CONFUSABLE)
+
+
+def _overlap(a: dict, b: dict) -> float:
+    """Footprint intersection as a share of the smaller footprint."""
+    ax0, ax1, az0, az1 = _footprint(a)
+    bx0, bx1, bz0, bz1 = _footprint(b)
+    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    iz = max(0.0, min(az1, bz1) - max(az0, bz0))
+    small = min((ax1 - ax0) * (az1 - az0), (bx1 - bx0) * (bz1 - bz0))
+    return ix * iz / max(small, 1e-6)
+
+
 def dedupe(objs: list[dict]) -> list[dict]:
     """Same object seen from neighbouring views / overlapping panorama crops.
 
-    Two detections merge when their footprints overlap: centre distance below
-    half the summed widths (min 0.5 m). The higher-scoring one wins.
+    Same-label detections merge when their footprints overlap or their
+    centres are close; confusable labels (desk vs cabinet) need a clear
+    overlap. Detections from one view never merge: the segmenter already
+    separated those. The higher-scoring one wins.
     """
     keep: list[dict] = []
     for o in sorted(objs, key=lambda o: o["score"], reverse=True):
         p = np.array(o["position"])
         dup = False
         for k in keep:
-            same_kind = k["label"] == o["label"] or "object" in (k["label"], o["label"])
-            dist = max(0.5, 0.5 * (k["size"][0] + o["size"][0]))
-            if same_kind and np.linalg.norm(np.array(k["position"]) - p) < dist:
-                dup = True
+            if k["source"]["view"] == o["source"]["view"] or k["mount"] != o["mount"]:
+                continue
+            if k["label"] == o["label"] or "object" in (k["label"], o["label"]):
+                near = np.linalg.norm(np.array(k["position"]) - p) < max(0.5, 0.5 * (k["size"][0] + o["size"][0]))
+                dup = near or _overlap(k, o) > 0.3
+            elif _same_kind(k["label"], o["label"]):
+                dup = _overlap(k, o) > 0.5
+            if dup:
                 break
         if not dup:
             keep.append(o)
@@ -177,14 +205,19 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         for vi, view in enumerate(views):
             write_status(pid, f"segmenting {view.id} ({models.segmenter.name})", 0.1 + 0.5 * vi / len(views))
             for det in models.segmenter.segment(view.image, prompts + ["floor"]):
-                if det.label == "floor":
+                if det.label in ("floor", "rug"):  # a rug is floor as far as the walls are concerned
                     floors[view.id] = floors.get(view.id, np.zeros_like(det.mask)) | det.mask
-                elif det.label != "rug":  # flat; better as floor texture than a box
+                else:
                     raw.append((view, det))
 
         # 2. room orientation + walls from the floor outline; from here on work in the room's frame
+        occluders = {}
+        for v, det in raw:
+            occluders[v.id] = occluders.get(v.id, np.zeros_like(det.mask)) | det.mask
+
         def outline():
-            pts = [wall_base_points(v, floors[v.id], camera_height) for v in views if v.id in floors]
+            pts = [wall_base_points(v, floors[v.id], camera_height, occluders=occluders.get(v.id))
+                   for v in views if v.id in floors]
             return np.concatenate(pts) if pts else np.zeros((0, 2))
         turn = room_rotation(outline())
         for v in views:
@@ -225,8 +258,11 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         box = (bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z)
         for view, det, depth_fn in wall_dets:
             pl = place_from_mask(view, det.mask, camera_height, box, depth_fn=depth_fn)
-            if pl is not None:
-                objects.append(_make_object(pid, pdir, view, det, pl))
+            if pl is None or pl.position[1] > height - 0.6:
+                continue  # pendant lights etc. hang from the ceiling, not a wall
+            if pl.position[1] + pl.size[1] > height:
+                pl.size = (pl.size[0], height - pl.position[1], pl.size[2])
+            objects.append(_make_object(pid, pdir, view, det, pl))
         objects = dedupe(objects)
 
         if reconstruct and models.reconstructor is not None:
@@ -262,6 +298,8 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
                      "panoYaw": round(turn, 4), "layout": "measured" if layout_ok else "guessed"},
             "panorama": pano, "views": view_meta, "objects": objects,
             "models": Models.info(),
+            # floor/wall contact points the walls were fitted to (thinned), for inspection
+            "outline": [[round(x, 2), round(z, 2)] for x, z in pts[:: max(1, len(pts) // 400)]],
         }
         (pdir / "scene.json").write_text(json.dumps(scene, indent=1))
         write_status(pid, "done", 1.0, objects=len(objects))
@@ -275,6 +313,8 @@ def _make_object(pid: str, pdir: Path, view: View, det: Detection, pl) -> dict:
     score = det.score * plausibility(det.label, w, h)
     if det.mask[:, 0].any() or det.mask[:, -1].any():
         score *= 0.6  # cut off by the frame: prefer a view that sees all of it
+    if pl.mount == "floor" and det.mask[-2:, :].any():
+        score *= 0.5  # runs off the bottom: we never saw where it meets the floor
     oid = uuid.uuid4().hex[:8]
     cpath = pdir / "cutouts" / f"{oid}.png"
     bbox = save_cutout(view, det, cpath)

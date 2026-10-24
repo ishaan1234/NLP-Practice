@@ -47,8 +47,13 @@ def plausibility(label: str, w: float, h: float) -> float:
 
 
 def wall_base_points(view: View, floor: np.ndarray, camera_height: float,
-                     max_dist: float = 12.0, step: int = 4) -> np.ndarray:
-    """Floor/wall contact points (x, z) seen in one view."""
+                     max_dist: float = 12.0, step: int = 4,
+                     occluders: np.ndarray | None = None) -> np.ndarray:
+    """Floor/wall contact points (x, z) seen in one view.
+
+    Columns where the floor ends at a detected object (`occluders`) are
+    skipped: that edge is furniture in front of the wall, not the wall.
+    """
     h, w = floor.shape
     pts = []
     for x in range(0, w, step):
@@ -58,6 +63,8 @@ def wall_base_points(view: View, floor: np.ndarray, camera_height: float,
         y = col.min()
         if y <= 1 or y >= h - 2:
             continue  # floor runs out of the frame: no wall in sight here
+        if occluders is not None and occluders[max(0, y - 6):y + 2, max(0, x - 2):x + 3].any():
+            continue
         ray = view.pixel_ray(x, y)
         if ray[1] > -0.01:
             continue
