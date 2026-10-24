@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { LIBRARY } from './furniture.js';
+import { setupSuggestions } from './layout-suggestions.js';
 import { normalizeLayout, alignTwin, applyAlignment } from './scanmerge.js';
 
 THREE.Cache.enabled = true;
@@ -74,7 +75,7 @@ function resize() {
   camera.updateProjectionMatrix();
 }
 new ResizeObserver(resize).observe(viewport);
-renderer.setAnimationLoop(() => { orbit.update(); updateOverlays(); renderer.render(scene, camera); });
+renderer.setAnimationLoop(() => { orbit.update(); updateSuggestions(); updateOverlays(); renderer.render(scene, camera); });
 
 // ---------------------------------------------------------------- state
 let project = null; // scene.json contents
@@ -84,6 +85,7 @@ let hovered = null;
 const undoStack = [];
 const redoStack = [];
 let saveTimer = null;
+const updateSuggestions = setupSuggestions({ THREE, getProject: () => project, nodes, scene, transform, checkpoint, rebuildObjects, markDirty, restoreSelection: () => select(selected) });
 
 function updateOverlays() {
   const n = selected && nodes.get(selected);

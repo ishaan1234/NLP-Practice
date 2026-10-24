@@ -23,6 +23,10 @@
   }
 }
 * { box-sizing: border-box; }
+.layout-suggestion { position: absolute; z-index: 30; top: 16px; left: 50%; transform: translateX(-50%); width: min(470px, calc(100% - 32px)); padding: 16px; border-radius: 12px; border: 1px solid var(--accent); background: var(--panel); box-shadow: 0 8px 30px #0003; }
+.layout-suggestion b { color: var(--accent); }
+.layout-suggestion p { line-height: 1.6; }
+.layout-preview .ai-bar, .layout-preview .help { pointer-events: none; opacity: .35; }
 html, body { margin: 0; height: 100%; }
 body {
   background: var(--bg); color: var(--ink);
