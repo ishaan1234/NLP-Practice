@@ -109,7 +109,7 @@ class Placement:
 
 def place_from_mask(view: View, mask: np.ndarray, camera_height: float,
                     bounds: tuple[float, float, float, float] | None = None,
-                    max_dist: float = 10.0, depth_fn=None) -> Placement | None:
+                    max_dist: float = 10.0, depth_fn=None, on_wall: bool = False) -> Placement | None:
     """Back-project a 2D mask into a box in the room.
 
     The lowest mask pixels are assumed to touch the floor, which pins the
@@ -118,6 +118,8 @@ def place_from_mask(view: View, mask: np.ndarray, camera_height: float,
     are placed on the room box `bounds` = (min_x, max_x, min_z, max_z); without
     bounds they are skipped (call again once the room is known).
     `depth_fn(width, mount)` supplies the unseen front-to-back depth.
+    `on_wall` forces wall placement (something below the horizon that doesn't touch the floor,
+    e.g. a picture or a drawing on a mural).
     """
     ys, xs = np.nonzero(mask)
     if len(xs) < 20:
@@ -131,7 +133,7 @@ def place_from_mask(view: View, mask: np.ndarray, camera_height: float,
 
     ray = view.pixel_ray(x_mid, y_bot)
     mount = "floor"
-    if ray[1] < -0.02:
+    if ray[1] < -0.02 and not on_wall:
         base = cam + ray * (camera_height / -ray[1])
     else:
         if bounds is None:

@@ -25,6 +25,7 @@ SIZE_PRIORS: dict[str, tuple[float, float, float]] = {
     "tv": (1.2, 0.7, 0.08), "monitor": (0.6, 0.45, 0.2), "stool": (0.4, 0.6, 0.4),
     "bench": (1.2, 0.45, 0.4), "ottoman": (0.6, 0.45, 0.6), "mirror": (0.6, 0.9, 0.03),
     "picture frame": (0.6, 0.5, 0.03),
+    "booth": (1.3, 1.4, 1.0), "whiteboard": (1.2, 1.8, 0.5), "bag": (0.4, 0.45, 0.25),
 }
 FLAT = {"tv", "mirror", "picture frame"}
 
@@ -138,3 +139,22 @@ def fit_bounds(pts: np.ndarray, min_points: int = 12) -> Bounds:
                   z0 if z0 is not None else -0.6, z1 if z1 is not None else 0.6,
                   seen={"min_x": x0 is not None, "max_x": x1 is not None,
                         "min_z": z0 is not None, "max_z": z1 is not None})
+
+
+def touches_floor(mask: np.ndarray, floor: np.ndarray | None, gap: int = 4, depth: int = 18) -> bool:
+    """Is there floor right under the object's lowest pixels?
+
+    Real furniture stands on the floor; a drawing on a wall or a picture hung low has wall
+    under it. Objects cut off by the bottom of the frame, or views without a floor mask,
+    can't be checked and count as touching.
+    """
+    h = mask.shape[0]
+    ys, xs = np.nonzero(mask)
+    if floor is None or not len(ys):
+        return True
+    y_bot = int(np.percentile(ys, 99))
+    if y_bot >= h - gap - 2:
+        return True
+    cols = np.unique(xs[ys >= y_bot - 3])
+    band = floor[y_bot + gap:min(h, y_bot + gap + depth), :][:, cols]
+    return band.size == 0 or band.mean() > 0.25

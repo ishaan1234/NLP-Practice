@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 DEFAULT_PROMPTS = [
     "chair", "armchair", "sofa", "table", "desk", "bed", "nightstand", "cabinet",
     "shelf", "wardrobe", "lamp", "plant", "tv", "monitor", "stool", "bench",
-    "ottoman", "rug", "mirror", "picture frame",
+    "ottoman", "rug", "mirror", "picture frame", "booth", "whiteboard", "bag",
 ]
 
 
@@ -38,7 +38,7 @@ def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(inter / np.logical_or(a, b).sum())
 
 
-STRUCTURE_LABELS = {"floor", "rug", "door", "window"}
+STRUCTURE_LABELS = {"floor", "rug", "door", "window", "ceiling"}
 
 
 def nms(dets: list[Detection], iou_thr: float = 0.5) -> list[Detection]:

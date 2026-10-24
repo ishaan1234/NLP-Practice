@@ -44,7 +44,8 @@ if os.path.exists("/content/.setup_done") or "SETUP_DONE" in open("/content/setu
 elif subprocess.run("pgrep -f 'gpu-worker/[s]etup.sh'", shell=True, capture_output=True).returncode:
     print("FAILED")
 else:
-    print("RUNNING " + subprocess.run("tail -1 /content/setup.log", shell=True, capture_output=True, text=True).stdout.strip()[:100])
+    last = open("/content/setup.log", errors="ignore").read()[-4000:].replace("\r", "\n").strip().splitlines()
+    print("RUNNING " + (last[-1].strip()[:100] if last else ""))  # progress bars redraw with \r
 PY
 )
   case "$state" in

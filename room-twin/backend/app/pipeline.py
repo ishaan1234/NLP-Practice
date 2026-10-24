@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 import uuid
 from pathlib import Path
@@ -13,14 +14,19 @@ from PIL import Image, ImageOps
 
 from .geometry import (View, equirect_to_perspective, estimate_pitch, hfov_from_exif,
                        is_equirectangular, place_from_mask)
-from .layout import Bounds, fit_bounds, plausibility, prior_depth, room_rotation, wall_base_points
+from .layout import (Bounds, fit_bounds, plausibility, prior_depth, room_rotation, touches_floor,
+                     wall_base_points)
 from .segmenters import DEFAULT_PROMPTS, Detection
 from .storage import DATA_DIR
 
 log = logging.getLogger(__name__)
 
 PANO_CROP_YAWS = [i * 45 for i in range(8)]
-STRUCTURE = ["floor", "door", "window"]  # segmented to understand the room, not turned into objects
+STRUCTURE = ["floor", "door", "window", "ceiling"]
+MIN_SCORE = float(os.environ.get("ROOM_TWIN_MIN_SCORE", "0.2"))
+# furniture that stands on the floor; never placed on a wall
+FLOOR_ONLY = {"chair", "armchair", "sofa", "table", "desk", "bed", "nightstand", "cabinet", "wardrobe",
+              "stool", "bench", "ottoman", "plant", "booth"}  # segmented to understand the room, not turned into objects
 PANO_CROP_PITCH = -20  # look down: furniture lives below the horizon
 # 120 x 108 deg crops: a bed 1.5 m away still fits in one view, and the floor is visible to ~0.4 m
 PANO_CROP_FOV = 120
@@ -171,6 +177,21 @@ def estimate_colors(views: list[View]) -> tuple[str, str]:
     return hexc(floor), hexc(wall)
 
 
+def _bottom_elevation(view: View, mask: np.ndarray) -> float:
+    """Sine of the elevation of the object's lowest point (> 0 = above the camera's eye level)."""
+    ys, xs = np.nonzero(mask)
+    y_bot = np.percentile(ys, 99)
+    return float(view.pixel_ray(float(np.median(xs[ys >= y_bot - 2])), y_bot)[1])
+
+
+def _surrounded_by(mask: np.ndarray, region: np.ndarray, ring: int = 8) -> bool:
+    """Mostly enclosed by `region` (e.g. a light fixture in the ceiling)?"""
+    from .geometry import _box
+    grown = _box(mask.astype(np.float32), ring) > 0
+    edge = grown & ~mask
+    return edge.any() and region[edge].mean() > 0.6
+
+
 def _footprint(o: dict) -> tuple[float, float, float, float]:
     x, _, z = o["position"]
     w, _, d = o["size"]
@@ -214,13 +235,20 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
                 dets = seg.segment(view.image, prompts) + seg.segment(view.image, STRUCTURE)
             # doors and windows get mistaken for wardrobes / cabinets / frames: drop those
             openings = [d.mask for d in dets if d.label in ("door", "window")]
+            ceiling = np.zeros(view.image.size[::-1], bool)
+            for d in dets:
+                if d.label == "ceiling":
+                    ceiling |= d.mask
             for det in dets:
                 if det.label in ("floor", "rug"):  # a rug is floor as far as the walls are concerned
                     floors[view.id] = floors.get(view.id, np.zeros_like(det.mask)) | det.mask
                 elif det.label not in STRUCTURE:
                     area = det.mask.sum()
-                    if not any((det.mask & m).sum() > 0.6 * area for m in openings):
-                        raw.append((view, det))
+                    if any((det.mask & m).sum() > 0.6 * area for m in openings):
+                        continue
+                    if ceiling.any() and _surrounded_by(det.mask, ceiling):
+                        continue  # ceiling lights, vents, sprinklers
+                    raw.append((view, det))
 
         # 2. room orientation + walls from the floor outline; from here on work in the room's frame
         occluders = {}
@@ -243,6 +271,9 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         objects, wall_dets = [], []
         for view, det in raw:
             depth_fn = lambda w, m, label=det.label: prior_depth(label, w, m)
+            if not touches_floor(det.mask, floors.get(view.id)):
+                wall_dets.append((view, det, depth_fn))  # wall art, a low-hung picture...
+                continue
             pl = place_from_mask(view, det.mask, camera_height, None, depth_fn=depth_fn)
             if pl is None:
                 wall_dets.append((view, det, depth_fn))
@@ -282,13 +313,20 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         # 4. wall-mounted objects go onto the walls we now know
         box = (bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z)
         for view, det, depth_fn in wall_dets:
-            pl = place_from_mask(view, det.mask, camera_height, box, depth_fn=depth_fn)
+            if det.label in FLOOR_ONLY:
+                continue  # a "chair" that doesn't touch the floor is a drawing, poster or reflection
+            if det.label == "lamp" and _bottom_elevation(view, det.mask) > 0.05:
+                continue  # above eye level and not on the floor: a ceiling light
+            pl = place_from_mask(view, det.mask, camera_height, box, depth_fn=depth_fn, on_wall=True)
             if pl is None or pl.position[1] > height - 0.6:
                 continue  # pendant lights etc. hang from the ceiling, not a wall
             if pl.position[1] + pl.size[1] > height:
                 pl.size = (pl.size[0], height - pl.position[1], pl.size[2])
             objects.append(_make_object(pid, pdir, view, det, pl))
         objects = dedupe(objects)
+        # after the plausibility / cut-off / wall checks, weak detections are mostly clutter
+        # (a bag on the table in front of the camera, a vent read as a TV)
+        objects = [o for o in objects if o["score"] >= MIN_SCORE]
 
         if reconstruct and models.reconstructor is not None:
             for i, o in enumerate(objects):
