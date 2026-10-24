@@ -11,8 +11,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
-from .geometry import (View, equirect_to_perspective, hfov_from_exif, is_equirectangular,
-                       place_from_mask)
+from .geometry import (View, equirect_to_perspective, estimate_pitch, hfov_from_exif,
+                       is_equirectangular, place_from_mask)
+from .layout import Bounds, fit_bounds, plausibility, prior_depth, room_rotation, wall_base_points
 from .segmenters import DEFAULT_PROMPTS, Detection
 
 log = logging.getLogger(__name__)
@@ -65,7 +66,8 @@ def rel(pid: str, path: Path) -> str:
 
 
 def build_views(pid: str, inputs: list[Path], mode: str, yaws_deg: list[float] | None,
-                hfov_deg: float | None) -> tuple[list[View], str | None]:
+                hfov_deg: float | None, pitches_deg: list[float | None] | None = None
+                ) -> tuple[list[View], str | None]:
     """Turn uploads into oriented perspective views (+ the panorama path if any)."""
     imgs = [ImageOps.exif_transpose(Image.open(p)).convert("RGB") for p in inputs]
     pano_idx = None
@@ -89,7 +91,14 @@ def build_views(pid: str, inputs: list[Path], mode: str, yaws_deg: list[float] |
         hfov = math.radians(hfov_deg) if hfov_deg else hfov_from_exif(Image.open(path))
         if img.width > 1600:
             img = img.resize((1600, round(img.height * 1600 / img.width)), Image.LANCZOS)
-        views.append(View(f"view_{i}", img, math.radians(yaw), 0.0, hfov, "photo", rel(pid, path)))
+        manual = pitches_deg[i] if pitches_deg and i < len(pitches_deg) else None
+        if manual is not None:
+            pitch, source = math.radians(manual), "manual"
+        else:  # people rarely hold the phone level: read the tilt off vertical edges
+            est, conf = estimate_pitch(img, hfov, return_confidence=True)
+            pitch, source = (est, "estimated") if est is not None and conf >= 0.12 else (0.0, "assumed level")
+        views.append(View(f"view_{i}", img, math.radians(yaw), pitch, hfov, "photo", rel(pid, path),
+                          meta={"pitchSource": source}))
     return views, None
 
 
@@ -133,10 +142,24 @@ def estimate_colors(views: list[View]) -> tuple[str, str]:
     return hexc(floor), hexc(wall)
 
 
+def _footprint(o: dict) -> tuple[float, float, float, float]:
+    x, _, z = o["position"]
+    w, _, d = o["size"]
+    c, s = abs(math.cos(o["rotationY"])), abs(math.sin(o["rotationY"]))
+    hx, hz = (w * c + d * s) / 2, (w * s + d * c) / 2
+    return x - hx, x + hx, z - hz, z + hz
+
+
+def _snap_to_walls(rot: float) -> float:
+    """Furniture almost always lines up with the walls: round to the nearest 90 deg."""
+    return round(rot / (math.pi / 2)) * (math.pi / 2)
+
+
 def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[float] | None = None,
                  hfov: float | None = None, camera_height: float = 1.5,
                  prompts: list[str] | None = None, room: tuple[float, float, float] = (5.0, 4.0, 2.7),
-                 reconstruct: bool = True, name: str = "My room"):
+                 reconstruct: bool = True, name: str = "My room",
+                 pitches: list[float | None] | None = None):
     pdir = project_dir(pid)
     (pdir / "cutouts").mkdir(exist_ok=True)
     (pdir / "meshes").mkdir(exist_ok=True)
@@ -144,46 +167,67 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         write_status(pid, "loading models", 0.02)
         models = Models.load()
         write_status(pid, "preparing views", 0.08)
-        views, pano = build_views(pid, inputs, mode, yaws, hfov)
-        prompts = prompts or DEFAULT_PROMPTS
-        width, depth, height = room
-        objects: list[dict] = []
-        view_meta = []
+        views, pano = build_views(pid, inputs, mode, yaws, hfov, pitches)
+        prompts = [p for p in (prompts or DEFAULT_PROMPTS) if p != "floor"]
+        height = room[2]
+
+        # 1. segment furniture + floor in every view
+        raw: list[tuple[View, Detection]] = []
+        floors: dict[str, np.ndarray] = {}
         for vi, view in enumerate(views):
             write_status(pid, f"segmenting {view.id} ({models.segmenter.name})", 0.1 + 0.5 * vi / len(views))
-            vpath = pdir / "views" / f"{view.id}.jpg"
-            vpath.parent.mkdir(exist_ok=True)
-            view.image.save(vpath, quality=90)
-            view_meta.append({"id": view.id, "image": rel(pid, vpath), "source": view.source,
-                              "yaw": math.degrees(view.yaw), "pitch": math.degrees(view.pitch),
-                              "hfov": math.degrees(view.hfov), "kind": view.kind})
-            for det in models.segmenter.segment(view.image, prompts):
-                if det.label == "rug":
-                    continue  # flat; better as floor texture than a box
-                pl = place_from_mask(view, det.mask, camera_height, (width / 2, depth / 2))
-                if pl is None:
-                    continue
-                score = det.score
-                if det.mask[:, 0].any() or det.mask[:, -1].any():
-                    score *= 0.6  # cut off by the frame: prefer a view that sees all of it
-                oid = uuid.uuid4().hex[:8]
-                cpath = pdir / "cutouts" / f"{oid}.png"
-                bbox = save_cutout(view, det, cpath)
-                objects.append({
-                    "id": oid, "label": det.label, "score": round(score, 3),
-                    "kind": "cutout", "cutout": rel(pid, cpath), "asset": None,
-                    "position": list(pl.position), "rotationY": pl.rotation_y,
-                    "scale": [1, 1, 1], "size": list(pl.size), "mount": pl.mount,
-                    "source": {"view": view.id, "bbox": bbox}, "_det": (view, det),
-                })
-        objects = dedupe(objects)
+            for det in models.segmenter.segment(view.image, prompts + ["floor"]):
+                if det.label == "floor":
+                    floors[view.id] = floors.get(view.id, np.zeros_like(det.mask)) | det.mask
+                elif det.label != "rug":  # flat; better as floor texture than a box
+                    raw.append((view, det))
 
-        # grow the room so everything we found fits inside it
-        if objects:
-            xs = [abs(o["position"][0]) + o["size"][0] / 2 for o in objects]
-            zs = [abs(o["position"][2]) + o["size"][2] / 2 for o in objects]
-            width = min(16.0, max(width, 2 * max(xs) + 0.2))
-            depth = min(16.0, max(depth, 2 * max(zs) + 0.2))
+        # 2. room orientation + walls from the floor outline; from here on work in the room's frame
+        def outline():
+            pts = [wall_base_points(v, floors[v.id], camera_height) for v in views if v.id in floors]
+            return np.concatenate(pts) if pts else np.zeros((0, 2))
+        turn = room_rotation(outline())
+        for v in views:
+            v.yaw += turn
+        pts = outline()
+        layout_ok = len(pts) >= 30
+        bounds = fit_bounds(pts) if layout_ok else Bounds(-room[0] / 2, room[0] / 2, -room[1] / 2, room[1] / 2)
+        seen = bounds.seen if layout_ok else {}
+
+        # 3. floor-standing objects pin themselves by where they touch the floor
+        objects, wall_dets = [], []
+        for view, det in raw:
+            depth_fn = lambda w, m, label=det.label: prior_depth(label, w, m)
+            pl = place_from_mask(view, det.mask, camera_height, None, depth_fn=depth_fn)
+            if pl is None:
+                wall_dets.append((view, det, depth_fn))
+                continue
+            objects.append(_make_object(pid, pdir, view, det, pl))
+
+        # drop things seen through doorways (well past a wall we actually saw); grow for the rest
+        kept = []
+        for o in objects:
+            x0, x1, z0, z1 = _footprint(o)
+            outside = ((seen.get("min_x") and x1 < bounds.min_x - 0.3) or (seen.get("max_x") and x0 > bounds.max_x + 0.3)
+                       or (seen.get("min_z") and z1 < bounds.min_z - 0.3) or (seen.get("max_z") and z0 > bounds.max_z + 0.3))
+            if not outside:
+                kept.append(o)
+                bounds.include(x0, x1, z0, z1)
+        objects = kept
+        for side, grow in (("x", 2.5), ("z", 2.5)):  # a room is at least ~2.5 m across
+            lo, hi = getattr(bounds, f"min_{side}"), getattr(bounds, f"max_{side}")
+            if hi - lo < grow:
+                pad = (grow - (hi - lo)) / 2
+                setattr(bounds, f"min_{side}", lo - pad)
+                setattr(bounds, f"max_{side}", hi + pad)
+
+        # 4. wall-mounted objects go onto the walls we now know
+        box = (bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z)
+        for view, det, depth_fn in wall_dets:
+            pl = place_from_mask(view, det.mask, camera_height, box, depth_fn=depth_fn)
+            if pl is not None:
+                objects.append(_make_object(pid, pdir, view, det, pl))
+        objects = dedupe(objects)
 
         if reconstruct and models.reconstructor is not None:
             for i, o in enumerate(objects):
@@ -199,11 +243,23 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         for o in objects:
             o.pop("_det", None)
 
+        view_meta = []
+        for view in views:
+            vpath = pdir / "views" / f"{view.id}.jpg"
+            vpath.parent.mkdir(exist_ok=True)
+            view.image.save(vpath, quality=90)
+            view_meta.append({"id": view.id, "image": rel(pid, vpath), "source": view.source,
+                              "yaw": round(math.degrees(view.yaw), 1), "pitch": round(math.degrees(view.pitch), 1),
+                              "hfov": round(math.degrees(view.hfov), 1), "kind": view.kind, **view.meta})
+
         floor_c, wall_c = estimate_colors(views)
+        w, d = bounds.size
         scene = {
             "version": 1, "id": pid, "name": name, "created": time.time(),
-            "room": {"width": round(width, 2), "depth": round(depth, 2), "height": height,
-                     "floorColor": floor_c, "wallColor": wall_c, "cameraHeight": camera_height},
+            "room": {"width": round(w, 2), "depth": round(d, 2), "height": height,
+                     "center": [round(c, 3) for c in bounds.center],
+                     "floorColor": floor_c, "wallColor": wall_c, "cameraHeight": camera_height,
+                     "panoYaw": round(turn, 4), "layout": "measured" if layout_ok else "guessed"},
             "panorama": pano, "views": view_meta, "objects": objects,
             "models": Models.info(),
         }
@@ -212,6 +268,23 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
     except Exception as e:
         log.exception("pipeline failed")
         write_status(pid, "error", 1.0, error=str(e))
+
+
+def _make_object(pid: str, pdir: Path, view: View, det: Detection, pl) -> dict:
+    w, h, _ = pl.size
+    score = det.score * plausibility(det.label, w, h)
+    if det.mask[:, 0].any() or det.mask[:, -1].any():
+        score *= 0.6  # cut off by the frame: prefer a view that sees all of it
+    oid = uuid.uuid4().hex[:8]
+    cpath = pdir / "cutouts" / f"{oid}.png"
+    bbox = save_cutout(view, det, cpath)
+    return {
+        "id": oid, "label": det.label, "score": round(score, 3),
+        "kind": "cutout", "cutout": rel(pid, cpath), "asset": None,
+        "position": [round(v, 3) for v in pl.position], "rotationY": _snap_to_walls(pl.rotation_y),
+        "scale": [1, 1, 1], "size": [round(v, 3) for v in pl.size], "mount": pl.mount,
+        "source": {"view": view.id, "bbox": bbox}, "_det": (view, det),
+    }
 
 
 def make_item_from_photo(pid: str, image_path: Path, prompt: str | None) -> dict:

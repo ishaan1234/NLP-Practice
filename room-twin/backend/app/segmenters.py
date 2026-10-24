@@ -8,6 +8,7 @@ still works on a laptop without the model; it is a demo, not a substitute.
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass
 
@@ -143,11 +144,79 @@ class FallbackSegmenter:
                 yield comp
 
 
+class GroundedSamSegmenter:
+    """Open-vocabulary detection (Grounding DINO) + box-prompted masks (SAM).
+
+    Both checkpoints are ungated on Hugging Face and run on CPU (a few seconds
+    per image), so this is the middle ground when SAM 3 isn't available.
+    """
+    name = "grounding-dino+sam"
+
+    def __init__(self, det_id: str = "IDEA-Research/grounding-dino-tiny",
+                 sam_id: str = "facebook/sam-vit-base", box_threshold: float = 0.35):
+        import torch
+        from transformers import (AutoModelForZeroShotObjectDetection, AutoProcessor, SamModel,
+                                  SamProcessor)
+
+        self.torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.det_proc = AutoProcessor.from_pretrained(det_id)
+        self.det = AutoModelForZeroShotObjectDetection.from_pretrained(det_id).to(self.device).eval()
+        self.sam_proc = SamProcessor.from_pretrained(sam_id)
+        self.sam = SamModel.from_pretrained(sam_id).to(self.device).eval()
+        self.box_threshold = box_threshold
+
+    def segment(self, image: Image.Image, prompts: list[str]) -> list[Detection]:
+        torch = self.torch
+        W, H = image.size
+        boxes, scores, labels = [], [], []
+        # Grounding DINO's text window is 256 tokens: ~24 short nouns fit in one pass
+        for i in range(0, len(prompts), 24):
+            group = prompts[i:i + 24]
+            text = " ".join(f"{p.lower()}." for p in group)
+            inputs = self.det_proc(images=image, text=text, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                out = self.det(**inputs)
+            res = self.det_proc.post_process_grounded_object_detection(
+                out, inputs["input_ids"], threshold=self.box_threshold, text_threshold=0.25,
+                target_sizes=[(H, W)])[0]
+            names = res.get("text_labels", res.get("labels"))
+            for box, score, name in zip(res["boxes"].tolist(), res["scores"].tolist(), names):
+                label = next((p for p in group if p.lower() in str(name)), None)
+                if label is None:
+                    continue  # merged / partial phrase we can't map back to a prompt
+                x0, y0, x1, y1 = box
+                if label != "floor" and (x1 - x0) * (y1 - y0) > 0.6 * W * H:
+                    continue  # "the whole room" boxes
+                boxes.append([x0, y0, x1, y1])
+                scores.append(score)
+                labels.append(label)
+        if not boxes:
+            return []
+        inputs = self.sam_proc(image, input_boxes=[boxes], return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            out = self.sam(**inputs, multimask_output=False)
+        masks = self.sam_proc.image_processor.post_process_masks(
+            out.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu())[0]
+        masks = masks.reshape(len(boxes), H, W).numpy()
+        dets = [Detection(l, m, float(s)) for l, m, s in zip(labels, masks, scores) if m.sum() > 50]
+        return nms(dets)
+
+
 def load_segmenter():
-    try:
-        seg = Sam3Segmenter()
-        log.info("SAM 3 loaded")
-        return seg
-    except Exception as e:  # ImportError, missing checkpoint, no GPU, ...
-        log.warning("SAM 3 unavailable (%s); using fallback segmenter", e)
-        return FallbackSegmenter()
+    """SAM 3 if installed, else Grounding DINO + SAM, else the colour-region fallback.
+
+    ROOM_TWIN_SEGMENTER=sam3|grounded-sam|fallback forces one.
+    """
+    choice = os.environ.get("ROOM_TWIN_SEGMENTER", "auto")
+    order = {"sam3": [Sam3Segmenter], "grounded-sam": [GroundedSamSegmenter],
+             "fallback": []}.get(choice, [Sam3Segmenter, GroundedSamSegmenter])
+    for cls in order:
+        try:
+            seg = cls()
+            log.info("segmenter: %s", seg.name)
+            return seg
+        except Exception as e:  # ImportError, missing / gated checkpoint, ...
+            log.warning("%s unavailable (%s)", cls.__name__, e)
+    log.warning("using fallback segmenter")
+    return FallbackSegmenter()

@@ -108,12 +108,16 @@ class Placement:
 
 
 def place_from_mask(view: View, mask: np.ndarray, camera_height: float,
-                    room_half: tuple[float, float], max_dist: float = 8.0) -> Placement | None:
+                    bounds: tuple[float, float, float, float] | None = None,
+                    max_dist: float = 10.0, depth_fn=None) -> Placement | None:
     """Back-project a 2D mask into a box in the room.
 
     The lowest mask pixels are assumed to touch the floor, which pins the
-    depth; width and height then follow from the mask extent at that depth.
-    Objects whose bottom is above the horizon are treated as wall-mounted.
+    distance; width and height then follow from the mask extent at that
+    distance. Objects whose bottom is above the horizon are wall-mounted and
+    are placed on the room box `bounds` = (min_x, max_x, min_z, max_z); without
+    bounds they are skipped (call again once the room is known).
+    `depth_fn(width, mount)` supplies the unseen front-to-back depth.
     """
     ys, xs = np.nonzero(mask)
     if len(xs) < 20:
@@ -128,41 +132,113 @@ def place_from_mask(view: View, mask: np.ndarray, camera_height: float,
     ray = view.pixel_ray(x_mid, y_bot)
     mount = "floor"
     if ray[1] < -0.02:
-        t = camera_height / -ray[1]
-        base = cam + t * ray
+        base = cam + ray * (camera_height / -ray[1])
     else:
-        # hits a wall: intersect with the room box
+        if bounds is None:
+            return None
         mount = "wall"
-        hx, hz = room_half
-        ts = [t for t in ((hx / ray[0]) if abs(ray[0]) > 1e-6 else math.inf,
-                          (-hx / ray[0]) if abs(ray[0]) > 1e-6 else math.inf,
-                          (hz / ray[2]) if abs(ray[2]) > 1e-6 else math.inf,
-                          (-hz / ray[2]) if abs(ray[2]) > 1e-6 else math.inf) if t > 0]
-        t = min(ts) if ts else 3.0
-        base = cam + t * ray
+        x0, x1, z0, z1 = bounds
+        ts = []
+        if ray[0] > 1e-6: ts.append(x1 / ray[0])
+        if ray[0] < -1e-6: ts.append(x0 / ray[0])
+        if ray[2] > 1e-6: ts.append(z1 / ray[2])
+        if ray[2] < -1e-6: ts.append(z0 / ray[2])
+        ts = [t for t in ts if t > 0]
+        if not ts:
+            return None
+        base = cam + min(ts) * ray
 
     horiz = math.hypot(base[0], base[2])
     if horiz < 0.3 or horiz > max_dist:
-        return None  # under the camera, or a sliver at the horizon (unreliable depth)
-    # depth along the viewing direction, used to size width / height
-    fwd = view.pixel_ray(view.size[0] / 2, view.size[1] / 2)
-    fwd_h = np.array([fwd[0], 0, fwd[2]]) / max(1e-6, math.hypot(fwd[0], fwd[2]))
-    depth = max(0.3, float(np.dot(base - cam, fwd_h)) if mount == "floor" else horiz)
+        return None  # under the camera, or a sliver at the horizon (unreliable distance)
 
-    width = abs(x_r - x_l) / view.focal * depth
-    top_ray = view.pixel_ray(x_mid, y_top)
-    t_top = horiz / max(1e-6, math.hypot(top_ray[0], top_ray[2]))
-    top_y = camera_height + t_top * top_ray[1]
-    height = max(0.05, top_y - base[1])
-    width = float(np.clip(width, 0.1, 4.0))
-    if height < 0.1:
+    def at_dist(px, py):  # point on the ray through (px, py) at the object's horizontal distance
+        r = view.pixel_ray(px, py)
+        return cam + r * (horiz / max(1e-6, math.hypot(r[0], r[2])))
+
+    y_mid = (y_top + y_bot) / 2
+    width = float(np.linalg.norm(at_dist(x_r, y_mid) - at_dist(x_l, y_mid)))
+    height = float(at_dist(x_mid, y_top)[1] - base[1])
+    if height < 0.1 or width < 0.05:
         return None
-    height = float(min(height, 3.0))
-    obj_depth = min(width, 0.6 if mount == "floor" else 0.05)
+    width, height = min(width, 5.0), min(height, 3.0)
+    obj_depth = depth_fn(width, mount) if depth_fn else min(width, 0.6 if mount == "floor" else 0.05)
 
     # push the base back by half the depth so the visible front face sits where we saw it
     dir_h = np.array([base[0], 0, base[2]]) / horiz
     center = base + dir_h * obj_depth / 2 if mount == "floor" else base - dir_h * obj_depth / 2
     rot = math.atan2(-center[0], -center[2])  # face toward the camera
     return Placement((float(center[0]), float(max(0.0, base[1])), float(center[2])),
-                     (width, height, obj_depth), rot, mount)
+                     (width, height, float(obj_depth)), rot, mount)
+
+
+def estimate_pitch(img: Image.Image, hfov: float, max_deg: float = 35.0,
+                   return_confidence: bool = False):
+    """Camera tilt (radians, + = looking up) from the lean of vertical edges.
+
+    With a level camera, vertical structure (door frames, wall corners, legs)
+    stays vertical in the image. Tilting the camera makes those edges converge
+    toward a vanishing point at y = cy - f / tan(pitch). Each near-vertical edge
+    pixel at (x, y) with lean k = dx/dy gives  k * f = tan(pitch) * a,
+    a = (x - cx) - (y - cy) * k, solved robustly (weighted median).
+    Returns None when the image has too little vertical structure to tell.
+    With return_confidence, returns (pitch, share of votes within 2 deg of the peak).
+    """
+    none = (None, 0.0) if return_confidence else None
+    w0 = 640
+    g = img.convert("L")
+    if g.width > w0:
+        g = g.resize((w0, round(g.height * w0 / g.width)), Image.BILINEAR)
+    a = np.asarray(g, dtype=np.float32)
+    h, w = a.shape
+    f = (w / 2) / math.tan(hfov / 2)
+    gx = np.zeros_like(a)
+    gy = np.zeros_like(a)
+    gx[1:-1, 1:-1] = (a[1:-1, 2:] - a[1:-1, :-2]) * 2 + (a[:-2, 2:] - a[:-2, :-2]) + (a[2:, 2:] - a[2:, :-2])
+    gy[1:-1, 1:-1] = (a[2:, 1:-1] - a[:-2, 1:-1]) * 2 + (a[2:, :-2] - a[:-2, :-2]) + (a[2:, 2:] - a[:-2, 2:])
+    # structure tensor: average gradient products over a 5x5 window so the edge
+    # direction is continuous instead of snapping to the pixel grid
+    jxx, jxy, jyy = _box(gx * gx, 2), _box(gx * gy, 2), _box(gy * gy, 2)
+    mag = np.sqrt(jxx + jyy)
+    coherent = (jxx - jyy) ** 2 + 4 * jxy ** 2 > (0.5 * (jxx + jyy)) ** 2
+    sel = (mag > np.percentile(mag, 90)) & (jxx > 4 * jyy) & coherent
+    # keep only pixels that sit on a vertical run (a real line, not texture)
+    run = sel.copy()
+    for s in range(1, 9):
+        run[s:] &= sel[:-s] | np.roll(sel, 1, 1)[:-s] | np.roll(sel, -1, 1)[:-s]
+    ys, xs = np.nonzero(run)
+    if len(xs) < 200:
+        return none
+    k = -jxy[ys, xs] / jxx[ys, xs]  # edge runs perpendicular to the gradient: dx/dy
+    xc, yc = xs - w / 2, ys - h / 2
+    aa = xc - yc * k
+    keep = (np.abs(aa) > 0.08 * w) & (np.abs(k) < 0.5)
+    if keep.sum() < 150:
+        return none
+    t = k[keep] * f / aa[keep]
+    wts = aa[keep] ** 2
+    lim = math.tan(math.radians(max_deg))
+    m = np.abs(t) < lim
+    if m.sum() < 100:
+        return none
+    # vote in angle space and take the peak: robust to the scattered leans of
+    # rug patterns / beams that aren't truly vertical
+    ang = np.degrees(np.arctan(t[m]))
+    bins = np.arange(-max_deg, max_deg + 0.25, 0.25)
+    hist, _ = np.histogram(ang, bins=bins, weights=np.sqrt(wts[m]))
+    total = hist.sum()
+    kern = np.exp(-0.5 * (np.arange(-8, 9) / 3.0) ** 2)  # sigma = 0.75 deg
+    hist = np.convolve(hist, kern, mode="same")
+    peak = int(np.argmax(hist))
+    pitch = math.radians((bins[peak] + bins[peak + 1]) / 2)
+    if not return_confidence:
+        return pitch
+    near = np.abs(ang - math.degrees(pitch)) < 2
+    return pitch, float(np.sqrt(wts[m])[near].sum() / max(total, 1e-6))
+
+
+def _box(a: np.ndarray, r: int) -> np.ndarray:
+    """Mean filter with a (2r+1)^2 window via cumulative sums."""
+    p = np.pad(a.astype(np.float64), r + 1, mode="edge").cumsum(0).cumsum(1)
+    n = 2 * r + 1
+    return (p[n:, n:] - p[:-n, n:] - p[n:, :-n] + p[:-n, :-n])[: a.shape[0], : a.shape[1]] / (n * n)

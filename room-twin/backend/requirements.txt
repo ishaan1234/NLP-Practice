@@ -5,7 +5,11 @@ python-multipart>=0.0.9
 pillow>=10.0
 numpy>=1.26
 
-# Optional: real models (GPU strongly recommended). See README.
+# Recommended: ungated Grounding DINO + SAM segmentation (works on CPU)
+# torch>=2.4
+# transformers>=4.45
+
+# Optional: SAM 3 / SAM 3D Objects (GPU strongly recommended). See README.
 #   SAM 3            -> https://github.com/facebookresearch/sam3
 #   SAM 3D Objects   -> https://github.com/facebookresearch/sam-3d-objects
 # torch>=2.5

@@ -34,6 +34,16 @@ This runs with **no GPU and no models**: segmentation falls back to a colour-reg
 and objects appear as photo cut-out cards. The header shows which backends a scene was built with
 (`segmenter: sam3 · 3D: sam3d-objects` vs `fallback · photo cutouts`).
 
+### Segmentation backends (picked automatically, best first)
+
+| Backend | Needs | Notes |
+|---|---|---|
+| **SAM 3** | GPU, gated checkpoint | best masks, text-prompted |
+| **Grounding DINO + SAM** | `pip install torch transformers` | ungated, runs on CPU (~15–40 s per image) |
+| colour-region fallback | nothing | demo only, labels everything "object", can't measure walls |
+
+Force one with `ROOM_TWIN_SEGMENTER=sam3|grounded-sam|fallback`.
+
 ### Enabling SAM 3 and SAM 3D Objects (GPU)
 
 Both models are gated on Hugging Face, so request access and run `huggingface-cli login` first.
@@ -74,22 +84,35 @@ keeps going with the fallback.
    in 3D, or use **Import .glb…** for an existing model.
 5. **Save** (it also autosaves), **Export GLB** for Blender / Unity, **Screenshot** for a PNG.
 
-## How placement works
+## How it works
 
-The capture camera is at `(0, camera_height, 0)` with the floor at `y = 0`. For each mask, the
-lowest pixels are assumed to touch the floor: casting that pixel's ray to the floor gives the
-object's distance, and the mask's width and height at that distance give its metric size.
-Masks whose bottom sits above the horizon are treated as wall-mounted and placed on the room
-box. The same object seen in several views / overlapping panorama crops is merged by footprint
-overlap, preferring views where it isn't cut off by the frame edge. See
-`backend/app/geometry.py`.
+The capture camera is at `(0, camera_height, 0)` with the floor at `y = 0`.
+
+1. **Camera per photo** – field of view from the photo's camera info (phones save it) or the
+   *Lens* setting. **Tilt is detected automatically**: vertical edges (door frames, corners, legs)
+   lean toward a common point when the camera is tilted, and that lean gives the angle
+   (`estimate_pitch` in `geometry.py`; median error 0.9° on test views at known tilts).
+   Override per photo if needed.
+2. **Segment** furniture *and the floor* in every view.
+3. **Room layout** (`layout.py`) – where the floor mask ends in each image column is where a
+   wall starts. Those points, projected onto the floor, outline the room: its rotation is
+   the angle that lines them up best, and each wall sits where its points pile up. Walls never
+   seen (e.g. behind a single photo) default to 0.6 m behind the camera.
+4. **Place objects** – the lowest pixels of a mask touch the floor, which pins distance;
+   width and height follow from the mask at that distance. Depth uses a per-type typical size
+   (a sofa is ~0.9 m deep, a frame is flat), and sizes far from typical lower the
+   confidence. Objects whose bottom is above eye level go onto the fitted walls. Everything is
+   turned to line up with the walls.
+5. **Merge** the same object seen from several views, preferring views where it isn't cut off.
 
 ## Known limitations
 
-- Multi-photo mode assumes all shots are taken from one spot with level camera; the yaw per
-  photo comes from you, not from feature matching. Plugging in a pose estimator
-  (e.g. VGGT / DUSt3R / COLMAP) in `build_views()` would lift this.
-- Room size is a starting guess (grown to fit detected objects); adjust it in the **Room** panel.
+- Multi-photo mode assumes all shots are taken from one spot; the direction per photo comes
+  from you, not from feature matching. Plugging in a pose estimator (e.g. VGGT / DUSt3R /
+  COLMAP) in `build_views()` would lift this.
+- Photos without camera info get a normal phone lens assumed; that only stretches depth, so
+  pick *Wide* for real-estate style shots.
+- Camera roll (a sideways-tilted horizon) isn't corrected.
 - SAM 3D Objects output orientation can vary; use **Re-orient model** on a selected object.
   Gaussian splats are shown as coloured point clouds.
 - The fallback segmenter is only a demo of the flow; it labels everything "object".

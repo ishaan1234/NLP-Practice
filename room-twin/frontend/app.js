@@ -153,16 +153,24 @@ async function save() {
 const panoShader = {
   vertexShader: `varying vec3 vWorld;
     void main() { vec4 w = modelMatrix * vec4(position, 1.0); vWorld = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`,
-  fragmentShader: `uniform sampler2D pano; uniform vec3 eye; varying vec3 vWorld;
+  fragmentShader: `uniform sampler2D pano; uniform vec3 eye; uniform float panoYaw; varying vec3 vWorld;
     void main() {
       vec3 d = normalize(vWorld - eye);
-      float u = atan(d.x, -d.z) / 6.28318530718 + 0.5;
+      // the scene was turned by panoYaw to line the room up with the axes; undo it for the lookup
+      float u = fract((atan(d.x, -d.z) - panoYaw) / 6.28318530718 + 0.5);
       float v = asin(clamp(d.y, -1.0, 1.0)) / 3.14159265359 + 0.5;
       gl_FragColor = texture2D(pano, vec2(u, v));
       #include <colorspace_fragment>
     }`,
 };
 let panoTexture = null;
+
+// Room box in world coordinates; the capture camera is at the origin, not necessarily the centre.
+function roomBox() {
+  const r = project.room;
+  const [cx, cz] = r.center || [0, 0];
+  return { cx, cz, x0: cx - r.width / 2, x1: cx + r.width / 2, z0: cz - r.depth / 2, z1: cz + r.depth / 2 };
+}
 
 function buildRoom() {
   roomGroup.clear();
@@ -171,28 +179,30 @@ function buildRoom() {
   const usePano = $('photoWalls').checked && panoTexture;
   const wallMat = usePano
     ? new THREE.ShaderMaterial({ ...panoShader, side: THREE.BackSide,
-        uniforms: { pano: { value: panoTexture }, eye: { value: new THREE.Vector3(0, r.cameraHeight, 0) } } })
+        uniforms: { pano: { value: panoTexture }, eye: { value: new THREE.Vector3(0, r.cameraHeight, 0) },
+          panoYaw: { value: r.panoYaw || 0 } } })
     : new THREE.MeshStandardMaterial({ color: r.wallColor, side: THREE.BackSide, roughness: 0.95 });
   const floorMat = usePano ? wallMat : new THREE.MeshStandardMaterial({ color: r.floorColor, side: THREE.BackSide, roughness: 0.9 });
   const hidden = new THREE.MeshBasicMaterial({ visible: false });
   // BoxGeometry face order: +x, -x, +y (ceiling), -y (floor), +z, -z. BackSide = dollhouse view.
   const shell = new THREE.Mesh(new THREE.BoxGeometry(r.width, r.height, r.depth),
     [wallMat, wallMat, hidden, floorMat, wallMat, wallMat]);
-  shell.position.y = r.height / 2;
+  const box = roomBox();
+  shell.position.set(box.cx, r.height / 2, box.cz);
   shell.receiveShadow = true;
   shell.name = 'room-shell';
   roomGroup.add(shell);
   if (usePano) { // the photo material is unlit, so catch shadows on a transparent overlay
     const catcher = new THREE.Mesh(new THREE.PlaneGeometry(r.width, r.depth), new THREE.ShadowMaterial({ opacity: 0.25 }));
     catcher.rotation.x = -Math.PI / 2;
-    catcher.position.y = 0.002;
+    catcher.position.set(box.cx, 0.002, box.cz);
     catcher.receiveShadow = true;
     roomGroup.add(catcher);
   }
   const grid = new THREE.GridHelper(Math.max(r.width, r.depth), Math.round(Math.max(r.width, r.depth) * 2), 0x888888, 0x888888);
   grid.material.opacity = usePano ? 0.0 : 0.12;
   grid.material.transparent = true;
-  grid.position.y = 0.003;
+  grid.position.set(box.cx, 0.003, box.cz);
   grid.name = 'grid';
   roomGroup.add(grid);
   // capture point marker
@@ -554,13 +564,13 @@ const WALL_SNAP = 0.15;
 // Keep the object's footprint inside the room; within WALL_SNAP of a wall, pull it flush.
 function keepInRoom(n, snapToWall = true) {
   if (!project) return;
-  const r = project.room;
+  const r = roomBox();
   const b = new THREE.Box3().setFromObject(n);
   const s = snapToWall ? WALL_SNAP : 0;
-  for (const [axis, half] of [['x', r.width / 2], ['z', r.depth / 2]]) {
-    if (b.max[axis] - b.min[axis] >= 2 * half) continue; // bigger than the room: leave it be
-    if (b.min[axis] < -half + s) n.position[axis] += -half - b.min[axis];
-    else if (b.max[axis] > half - s) n.position[axis] += half - b.max[axis];
+  for (const [axis, lo, hi] of [['x', r.x0, r.x1], ['z', r.z0, r.z1]]) {
+    if (b.max[axis] - b.min[axis] >= hi - lo) continue; // bigger than the room: leave it be
+    if (b.min[axis] < lo + s) n.position[axis] += lo - b.min[axis];
+    else if (b.max[axis] > hi - s) n.position[axis] += hi - b.max[axis];
   }
 }
 
@@ -622,28 +632,28 @@ function spawnPoint() {
   // on the floor where the camera looks, clamped into the room
   const p = new THREE.Vector3();
   raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-  if (!raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p)) p.set(0, 0, 0);
-  const r = project.room;
-  p.x = THREE.MathUtils.clamp(p.x, -r.width / 2 + 0.5, r.width / 2 - 0.5);
-  p.z = THREE.MathUtils.clamp(p.z, -r.depth / 2 + 0.5, r.depth / 2 - 0.5);
+  const r = roomBox();
+  if (!raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p)) p.set(r.cx, 0, r.cz);
+  p.x = THREE.MathUtils.clamp(p.x, r.x0 + 0.5, r.x1 - 0.5);
+  p.z = THREE.MathUtils.clamp(p.z, r.z0 + 0.5, r.z1 - 0.5);
   return p;
 }
 
 // Nearest spot (spiralling out from p) where a w×d footprint doesn't overlap anything.
 function freeSpot(p, w, d) {
-  const r = project.room;
+  const r = roomBox();
   const taken = [...nodes.values()].filter((n) => n.visible).map((n) => new THREE.Box3().setFromObject(n));
   const fits = (x, z) => {
     const b = new THREE.Box3(new THREE.Vector3(x - w / 2, 0.02, z - d / 2), new THREE.Vector3(x + w / 2, 1, z + d / 2));
     return !taken.some((t) => t.intersectsBox(b));
   };
-  const cx = (v, half, s) => THREE.MathUtils.clamp(v, -half + s / 2, half - s / 2);
+  const clamp = (v, lo, hi, s) => THREE.MathUtils.clamp(v, lo + s / 2, hi - s / 2);
   for (let ring = 0; ring < 14; ring++) {
     const steps = Math.max(1, ring * 8);
     for (let k = 0; k < steps; k++) {
       const a = (k / steps) * Math.PI * 2;
-      const x = cx(p.x + Math.cos(a) * ring * 0.3, r.width / 2, w);
-      const z = cx(p.z + Math.sin(a) * ring * 0.3, r.depth / 2, d);
+      const x = clamp(p.x + Math.cos(a) * ring * 0.3, r.x0, r.x1, w);
+      const z = clamp(p.z + Math.sin(a) * ring * 0.3, r.z0, r.z1, d);
       if (fits(x, z)) return new THREE.Vector3(x, 0, z);
     }
   }
@@ -758,10 +768,11 @@ $('snap').onchange = (e) => {
 
 function setView(kind) {
   const r = project?.room || { width: 5, depth: 4, cameraHeight: 1.5 };
+  const { cx, cz } = project ? roomBox() : { cx: 0, cz: 0 };
   const span = Math.max(r.width, r.depth);
-  if (kind === 'top') { camera.position.set(0, span * 1.6, 0.001); orbit.target.set(0, 0, 0); }
+  if (kind === 'top') { camera.position.set(cx, span * 1.6, cz + 0.001); orbit.target.set(cx, 0, cz); }
   else if (kind === 'eye') { camera.position.set(0, r.cameraHeight, 0.01); orbit.target.set(0, r.cameraHeight, -0.5); }
-  else { camera.position.set(span * 0.9, span * 1.1, span * 1.2); orbit.target.set(0, 0.6, 0); }
+  else { camera.position.set(cx + span * 0.9, span * 1.1, cz + span * 1.2); orbit.target.set(cx, 0.6, cz); }
   orbit.update();
 }
 $('topView').onclick = () => setView('top');
@@ -846,15 +857,17 @@ $('exportGlb').onclick = () => {
   if (!project) return;
   const out = new THREE.Scene();
   const r = project.room;
+  const { cx, cz } = roomBox();
   const floor = new THREE.Mesh(new THREE.PlaneGeometry(r.width, r.depth), new THREE.MeshStandardMaterial({ color: r.floorColor }));
   floor.rotation.x = -Math.PI / 2;
+  floor.position.set(cx, 0, cz);
   floor.name = 'floor';
   out.add(floor);
   const wm = new THREE.MeshStandardMaterial({ color: r.wallColor, side: THREE.DoubleSide });
   for (const [w, x, z, ry] of [[r.width, 0, -r.depth / 2, 0], [r.width, 0, r.depth / 2, Math.PI],
     [r.depth, -r.width / 2, 0, Math.PI / 2], [r.depth, r.width / 2, 0, -Math.PI / 2]]) {
     const wall = new THREE.Mesh(new THREE.PlaneGeometry(w, r.height), wm);
-    wall.position.set(x, r.height / 2, z);
+    wall.position.set(cx + x, r.height / 2, cz + z);
     wall.rotation.y = ry;
     out.add(wall);
   }
@@ -895,6 +908,20 @@ function directionPicker(p, i) {
   return wrap;
 }
 
+// Camera tilt per photo: auto-detected from vertical edges unless the user says otherwise.
+function tiltPicker(p) {
+  const sel = document.createElement('select');
+  sel.title = 'How the camera was tilted. Auto works it out from door frames, corners and furniture legs.';
+  for (const [v, name] of [['', 'tilt: auto'], ['0', 'level'], ['-10', 'down 10°'], ['-20', 'down 20°'],
+    ['-30', 'down 30°'], ['10', 'up 10°']]) sel.add(new Option(name, v));
+  sel.value = p.pitch ?? '';
+  sel.onchange = () => (p.pitch = sel.value === '' ? null : +sel.value);
+  const wrap = document.createElement('div');
+  wrap.className = 'dir';
+  wrap.appendChild(sel);
+  return wrap;
+}
+
 async function startBlank(e) {
   e?.preventDefault();
   const fd = new FormData();
@@ -920,6 +947,7 @@ function renderThumbs() {
     img.src = p.url;
     fig.appendChild(img);
     if (multi && pending.length > 1) fig.appendChild(directionPicker(p, i));
+    if (multi) fig.appendChild(tiltPicker(p));
     box.appendChild(fig);
   });
   $('build').disabled = !pending.length;
@@ -945,6 +973,8 @@ $('build').onclick = async () => {
   fd.append('name', pending[0]?.file.name.replace(/\.\w+$/, '') || 'My room');
   fd.append('mode', $('mode').value);
   fd.append('yaws', JSON.stringify(pending.map((p) => p.yaw)));
+  fd.append('pitches', JSON.stringify(pending.map((p) => p.pitch ?? null)));
+  if ($('lens').value) fd.append('hfov', $('lens').value);
   fd.append('camera_height', $('camH').value);
   fd.append('room_width', $('roomW').value);
   fd.append('room_depth', $('roomD').value);

@@ -59,6 +59,7 @@ async def create_project(
     name: str = Form("My room"),
     mode: str = Form("auto"),  # auto | 360 | multiview
     yaws: str = Form(""),  # JSON list of degrees, one per photo
+    pitches: str = Form(""),  # JSON list of degrees or null (auto-detect), one per photo
     hfov: float | None = Form(None),
     camera_height: float = Form(1.5),
     prompts: str = Form(""),  # comma separated
@@ -79,13 +80,17 @@ async def create_project(
         yaw_list = [float(y) for y in json.loads(yaws)] if yaws.strip() else None
     except (ValueError, TypeError):
         raise HTTPException(400, "yaws must be a JSON list of numbers")
+    try:
+        pitch_list = [None if v is None else float(v) for v in json.loads(pitches)] if pitches.strip() else None
+    except (ValueError, TypeError):
+        raise HTTPException(400, "pitches must be a JSON list of numbers or nulls")
     prompt_list = [p.strip() for p in prompts.split(",") if p.strip()] or None
     write_status(pid, "queued", 0.0)
     (pdir / "meta.json").write_text(json.dumps({"name": name, "created": time.time()}))
     threading.Thread(
         target=run_pipeline, daemon=True,
         args=(pid, paths, mode, yaw_list, hfov, camera_height, prompt_list,
-              (room_width, room_depth, room_height), reconstruct, name),
+              (room_width, room_depth, room_height), reconstruct, name, pitch_list),
     ).start()
     return {"id": pid}
 
