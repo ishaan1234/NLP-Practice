@@ -18,7 +18,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import assistant, catalog, generate
+from . import assistant, catalog, generate, gpu_client
 from .capture import router as capture_router, sanitize_image
 from .pipeline import Models, make_item_from_photo, project_dir, run_pipeline, write_status
 from .storage import DATA_DIR, DEPLOYED, store
@@ -68,7 +68,14 @@ def _save_upload(f: UploadFile, dest_dir: Path, stem: str) -> Path:
 @app.get("/api/capabilities")
 def capabilities():
     return {**Models.info(), "storage": store.kind, "deployed": DEPLOYED, "maxUpload": MAX_UPLOAD,
-            "assistant": assistant._client() is not None, "generator": generate.available()}
+            "assistant": assistant._client() is not None, "generator": generate.available(),
+            "gpu": gpu_client.configured(), "make3d": gpu_client.configured() or _local_sam3d()}
+
+
+def _local_sam3d() -> bool:
+    import importlib.util
+    import os
+    return bool(os.environ.get("SAM3D_REPO")) and importlib.util.find_spec("torch") is not None
 
 
 @app.post("/api/projects")
@@ -107,7 +114,9 @@ def create_project(
     write_status(pid, "queued", 0.0)
     (pdir / "meta.json").write_text(json.dumps({"name": name, "created": time.time(), "owner": _owner(x_owner)}))
     args = (pid, paths, mode, yaw_list, hfov, camera_height, prompt_list,
-            (room_width, room_depth, room_height), reconstruct, name, pitch_list)
+            (room_width, room_depth, room_height), False, name, pitch_list)
+    # 3D models are made afterwards, one object per request (/objects/{oid}/3d): the twin shows
+    # up right away and each call stays well inside a serverless time limit
     if DEPLOYED:  # a function can be frozen once it has answered: build now, then store the result
         run_pipeline(*args)
         store.publish(pid)
@@ -213,6 +222,41 @@ def project_file(pid: str, path: str):
     if not PID_RE.match(pid) or any(s in ("", ".", "..") for s in path.split("/")):
         raise HTTPException(404)
     return store.file(pid, path)
+
+
+@app.post("/api/projects/{pid}/objects/{oid}/3d")
+def make_3d(pid: str, oid: str, x_owner: str | None = Header(None)):
+    """Turn one photo cut-out into a real 3D model with SAM 3D Objects (local or remote GPU)."""
+    _owned(pid, x_owner)
+    if not re.fullmatch(r"[a-f0-9]{8}", oid):
+        raise HTTPException(404, "unknown object")
+    models = Models.load()
+    if models.reconstructor is None:
+        raise HTTPException(501, "no 3D reconstructor: set ROOM_TWIN_GPU_URL/TOKEN or install SAM 3D Objects")
+    local = DATA_DIR / pid / "cutouts" / f"{oid}.png"
+    if local.exists():
+        data = local.read_bytes()
+    else:
+        res = store.file(pid, f"cutouts/{oid}.png")
+        data = getattr(res, "body", None)
+        if data is None:
+            raise HTTPException(404, "cut-out not found")
+    import io
+    import numpy as np
+    from PIL import Image
+    rgba = Image.open(io.BytesIO(data)).convert("RGBA")
+    mask = np.asarray(rgba)[:, :, 3] > 127
+    out = project_dir(pid) / "meshes"
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        result = models.reconstructor.reconstruct(rgba.convert("RGB"), mask, out / oid)
+    except Exception as e:
+        raise HTTPException(502, f"3D reconstruction failed: {e}")
+    if result is None:
+        raise HTTPException(502, "the 3D model came back empty")
+    kind, path = result
+    store.publish(pid, [path])
+    return {"kind": kind, "asset": f"files/{pid}/meshes/{path.name}"}
 
 
 @app.get("/library/{path:path}")

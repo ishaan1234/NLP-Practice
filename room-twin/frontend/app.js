@@ -295,6 +295,7 @@ function buildNode(o) {
       const wrap = new THREE.Group();
       wrap.add(holder);
       fitInto(wrap, o.size);
+      const fitted = new THREE.Box3().setFromObject(wrap).getSize(new THREE.Vector3()); // before rotation
       inner.add(wrap);
       obj.traverse((c) => {
         if (!c.isMesh) return;
@@ -303,7 +304,7 @@ function buildNode(o) {
       });
       // record the model's real size once, so resizing and the size label work in metres
       if (!o.size || o.size.some((v) => !(v > 0))) {
-        o.size = new THREE.Box3().setFromObject(wrap).getSize(new THREE.Vector3()).toArray().map((v) => +v.toFixed(3));
+        o.size = fitted.toArray().map((v) => +v.toFixed(3));
         if (selected === o.id) fillInspector();
       }
     };
@@ -462,9 +463,54 @@ function fillInspector() {
   }
   if (o.kind === 'mesh' || o.kind === 'pointcloud') {
     const b = document.createElement('button');
-    b.textContent = 'Re-orient model (90° X)';
+    b.textContent = 'Tip model (90° X)';
     b.onclick = () => { checkpoint(); o.modelRotX = ((o.modelRotX || 0) + 90) % 360; refreshNode(o); markDirty(); };
+    const t = document.createElement('button');
+    t.textContent = 'Turn model (90°)';
+    t.onclick = () => { checkpoint(); o.modelRotY = ((o.modelRotY || 0) + 90) % 360; refreshNode(o); markDirty(); };
+    src.append(b, t);
+    if (o.cutout) {
+      const back = document.createElement('button');
+      back.textContent = 'Back to photo cut-out';
+      back.onclick = () => { checkpoint(); o.kind = 'cutout'; o.photoOnly = true; refreshNode(o); fillInspector(); markDirty(); };
+      src.appendChild(back);
+    }
+  } else if (o.kind === 'cutout' && caps.make3d) {
+    const b = document.createElement('button');
+    b.textContent = 'Make 3D model';
+    b.onclick = () => { o.photoOnly = false; o.failed3d = false; make3d([o]); };
     src.appendChild(b);
+  }
+}
+
+// Photo cut-outs -> real 3D models (SAM 3D Objects on a local or remote GPU), one request per
+// object so the room is usable straight away and each call stays short.
+let making3d = false;
+async function make3d(list) {
+  if (making3d || !project) return;
+  making3d = true;
+  const pid = project.id;
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const o = list[i];
+      if (project?.id !== pid || !byId(o.id) || o.kind !== 'cutout') continue;
+      showReply(`Making 3D models… ${i + 1} of ${list.length} (${o.label})`);
+      try {
+        const res = await api(`/api/projects/${pid}/objects/${o.id}/3d`, { method: 'POST' });
+        if (project?.id !== pid || !byId(o.id)) continue;
+        Object.assign(o, { kind: res.kind, asset: res.asset });
+        refreshNode(o);
+        if (selected === o.id) fillInspector();
+        markDirty();
+      } catch (err) {
+        o.failed3d = true;
+        console.warn('3D failed for', o.label, err);
+        if (/501/.test(err.message) || /no 3D reconstructor/.test(err.message)) break;
+      }
+    }
+    showReply('3D models done');
+  } finally {
+    making3d = false;
   }
 }
 
@@ -1283,6 +1329,11 @@ async function openProject(id) {
   $('hint').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');
   $('aiForm').classList.remove('hidden');
+  await capsReady.catch(() => {});
+  if (caps.make3d) {
+    const todo = project.objects.filter((o) => o.kind === 'cutout' && !o.photoOnly && !o.failed3d && o.source?.view);
+    if (todo.length) setTimeout(() => make3d(todo), 500);
+  }
   setHere(null);
   aiHistory.length = 0;
   lastChanged = null;
@@ -1501,7 +1552,7 @@ $('aiForm').onsubmit = async (e) => {
   }
 };
 
-api('/api/capabilities').then((c) => {
+const capsReady = api('/api/capabilities').then((c) => {
   caps = c;
   if (c.assistant === false) $('aiInput').placeholder = "Ask: 'add a vase here', 'make it 20% bigger' (simple mode: set ANTHROPIC_API_KEY for full AI)";
   if (c.storage === 'temporary') toast('Rooms are not kept on this deployment yet: connect a Vercel Blob store to save them', 8000);

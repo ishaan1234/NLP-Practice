@@ -62,6 +62,13 @@ export SAM3D_REPO=$PWD/sam-3d-objects          # where notebook/inference.py liv
 Models load lazily on the first build. If either fails to import, the server logs why and
 keeps going with the fallback.
 
+## Real 3D models without your own GPU
+
+SAM 3D Objects needs a Linux machine with a >= 32 GB NVIDIA GPU. Run it on a Colab A100 (or any
+GPU box) with [`gpu-worker/`](gpu-worker/README.md) and set `ROOM_TWIN_GPU_URL` /
+`ROOM_TWIN_GPU_TOKEN`: the app - locally or on Vercel - then uses SAM 3 for segmentation and turns
+each detected object into a real 3D mesh, one at a time after the room appears.
+
 ## Deploy on Vercel
 
 The editor and the photo → twin flow run on Vercel's Python runtime. The GPU models don't

@@ -51,7 +51,36 @@ class Sam3DReconstructor:
         return None
 
 
+class RemoteReconstructor:
+    """SAM 3D Objects on a remote GPU worker (gpu-worker/, e.g. a Colab A100)."""
+    name = "sam3d-objects (remote GPU)"
+
+    def __init__(self):
+        from . import gpu_client
+        self.client = gpu_client
+        if not gpu_client.health().get("sam3d"):
+            raise RuntimeError("the GPU worker has no SAM 3D Objects")
+
+    def reconstruct(self, image: Image.Image, mask: np.ndarray, out_stem: Path) -> tuple[str, Path] | None:
+        import io
+        buf = io.BytesIO()
+        Image.fromarray(mask.astype(np.uint8) * 255).save(buf, "PNG")
+        kind, data = self.client.reconstruct(image.convert("RGB"), buf.getvalue())
+        path = out_stem.with_suffix(".glb" if kind == "mesh" else ".ply")
+        path.write_bytes(data)
+        return kind, path
+
+
 def load_reconstructor():
+    from . import gpu_client
+
+    if gpu_client.configured():
+        try:
+            rec = RemoteReconstructor()
+            log.info("SAM 3D Objects on the remote GPU worker")
+            return rec
+        except Exception as e:
+            log.warning("remote GPU worker unavailable for 3D (%s)", e)
     try:
         rec = Sam3DReconstructor()
         log.info("SAM 3D Objects loaded")

@@ -227,14 +227,40 @@ class GroundedSamSegmenter:
         return self._masks(image, b1 + b2, s1 + s2, l1 + l2)
 
 
+class RemoteSegmenter:
+    """SAM 3 on a remote GPU worker (gpu-worker/, e.g. a Colab A100)."""
+    name = "sam3 (remote GPU)"
+
+    def __init__(self):
+        from . import gpu_client
+        self.client = gpu_client
+        gpu_client.health()  # fail now, not mid-build, if the worker is unreachable
+
+    def segment(self, image: Image.Image, prompts: list[str]) -> list[Detection]:
+        import base64
+        import io
+        dets = []
+        for d in self.client.segment(image, prompts):
+            m = Image.open(io.BytesIO(base64.b64decode(d["mask"]))).convert("L")
+            if m.size != image.size:
+                m = m.resize(image.size, Image.NEAREST)
+            dets.append(Detection(d["label"], np.asarray(m) > 127, float(d["score"])))
+        return dets
+
+
 def load_segmenter():
     """SAM 3 if installed, else Grounding DINO + SAM, else the colour-region fallback.
 
-    ROOM_TWIN_SEGMENTER=sam3|grounded-sam|fallback forces one.
+    With ROOM_TWIN_GPU_URL/ROOM_TWIN_GPU_TOKEN set, a remote GPU worker comes first.
+    ROOM_TWIN_SEGMENTER=sam3|grounded-sam|remote|fallback forces one.
     """
+    from . import gpu_client
+
     choice = os.environ.get("ROOM_TWIN_SEGMENTER", "auto")
-    order = {"sam3": [Sam3Segmenter], "grounded-sam": [GroundedSamSegmenter],
+    order = {"sam3": [Sam3Segmenter], "grounded-sam": [GroundedSamSegmenter], "remote": [RemoteSegmenter],
              "fallback": []}.get(choice, [Sam3Segmenter, GroundedSamSegmenter])
+    if choice == "auto" and gpu_client.configured():
+        order = [RemoteSegmenter, *order]  # a GPU worker was set up on purpose: use it first
     for cls in order:
         try:
             seg = cls()
