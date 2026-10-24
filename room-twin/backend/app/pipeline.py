@@ -272,11 +272,15 @@ def run_pipeline(pid: str, inputs: list[Path], mode: str = "auto", yaws: list[fl
         for view, det in raw:
             depth_fn = lambda w, m, label=det.label: prior_depth(label, w, m)
             if not touches_floor(det.mask, floors.get(view.id)):
+                if det.mask[-max(3, det.mask.shape[0] // 33):].any():
+                    continue  # cut off by the bottom of the photo: foreground clutter (a bag on your table)
                 wall_dets.append((view, det, depth_fn))  # wall art, a low-hung picture...
                 continue
             pl = place_from_mask(view, det.mask, camera_height, None, depth_fn=depth_fn)
             if pl is None:
-                wall_dets.append((view, det, depth_fn))
+                if _bottom_elevation(view, det.mask) > -0.02:  # above eye level: a wall item
+                    wall_dets.append((view, det, depth_fn))
+                # else: right under the camera (a bag on your own table) or past the horizon - skip
                 continue
             objects.append(_make_object(pid, pdir, view, det, pl))
 

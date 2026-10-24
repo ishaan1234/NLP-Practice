@@ -37,7 +37,8 @@ PY
 
 # wait for setup, polling in short calls
 while true; do
-  state=$(colab exec -s "$SESSION" 2>/dev/null <<'PY'
+  # a dropped connection can leave `colab exec` hanging: cap each poll and just try again
+  state=$(timeout 120 colab exec -s "$SESSION" 2>/dev/null <<'PY'
 import os, subprocess
 if os.path.exists("/content/.setup_done") or "SETUP_DONE" in open("/content/setup.log", errors="ignore").read()[-2000:]:
     print("DONE")
@@ -51,11 +52,17 @@ PY
   case "$state" in
     *DONE*) break ;;
     *FAILED*) echo "[roomtwin] setup failed; see: colab exec -s $SESSION <<< 'print(open(\"/content/setup.log\").read()[-3000:])'" >&2; exit 1 ;;
-    *) echo "[roomtwin] installing... ${state#*RUNNING }" >&2; sleep 30 ;;
+    *RUNNING*) echo "[roomtwin] installing... ${state#*RUNNING }" >&2; sleep 30 ;;
+    *) echo "[roomtwin] (lost touch with Colab for a moment, retrying)" >&2; sleep 10 ;;
   esac
 done
 
-colab exec -s "$SESSION" <<'PY'
+for _ in 1 2 3; do
+  out=$(timeout 300 colab exec -s "$SESSION" <<'PY'
 import subprocess
 print(subprocess.run(["bash", "/content/room-twin/gpu-worker/start.sh"], capture_output=True, text=True).stdout)
 PY
+) && echo "$out" | grep -q "ROOM_TWIN_GPU_URL=https" && { echo "$out" | grep ROOM_TWIN_; exit 0; }
+  echo "[roomtwin] starting the worker didn't answer, retrying..." >&2
+done
+exit 1

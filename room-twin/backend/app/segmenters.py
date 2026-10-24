@@ -8,6 +8,7 @@ still works on a laptop without the model; it is a demo, not a substitute.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -63,6 +64,13 @@ class Sam3Segmenter:
         self.score_threshold = score_threshold
 
     def segment(self, image: Image.Image, prompts: list[str]) -> list[Detection]:
+        import torch
+        # SAM 3 mixes bfloat16 and float32 layers: it must run under autocast on CUDA
+        ctx = torch.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+        with ctx, torch.inference_mode():
+            return self._segment(image, prompts)
+
+    def _segment(self, image: Image.Image, prompts: list[str]) -> list[Detection]:
         state = self.processor.set_image(image)
         dets: list[Detection] = []
         for prompt in prompts:

@@ -71,6 +71,34 @@ class RemoteReconstructor:
         return kind, path
 
 
+class TrellisReconstructor:
+    """Microsoft TRELLIS (MIT, ungated weights): photo + mask -> textured mesh.
+
+    The stand-in while SAM 3D Objects access is pending; same input and output as SAM 3D.
+    TRELLIS_REPO points at a clone of github.com/microsoft/TRELLIS (default /content/TRELLIS).
+    """
+    name = "trellis"
+
+    def __init__(self):
+        os.environ.setdefault("SPCONV_ALGO", "native")
+        sys.path.insert(0, os.environ.get("TRELLIS_REPO", "/content/TRELLIS"))
+        from trellis.pipelines import TrellisImageTo3DPipeline  # type: ignore
+        from trellis.utils import postprocessing_utils  # type: ignore
+
+        self.pipe = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
+        self.pipe.cuda()
+        self.post = postprocessing_utils
+
+    def reconstruct(self, image: Image.Image, mask: np.ndarray, out_stem: Path) -> tuple[str, Path] | None:
+        rgba = image.convert("RGB").copy()
+        rgba.putalpha(Image.fromarray(mask.astype(np.uint8) * 255))  # TRELLIS uses the alpha as the mask
+        out = self.pipe.run(rgba, seed=42)
+        glb = self.post.to_glb(out["gaussian"][0], out["mesh"][0], simplify=0.95, texture_size=1024)
+        path = out_stem.with_suffix(".glb")
+        glb.export(str(path))
+        return "mesh", path
+
+
 def load_reconstructor():
     from . import gpu_client
 

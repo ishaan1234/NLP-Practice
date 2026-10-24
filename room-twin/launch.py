@@ -7,7 +7,7 @@
     python launch.py stop      stop the Colab GPU session (stops using compute units)
     python launch.py status    show what is configured
 
-Needs Hugging Face access to facebook/sam3 and facebook/sam-3d-objects, and on Windows WSL
+Needs Hugging Face access to facebook/sam3 (and facebook/sam-3d-objects; until then TRELLIS is used), and on Windows WSL
 (`wsl --install` once), because Google's Colab CLI runs on Linux/macOS only.
 
 Settings live in .roomtwin.env (not committed).
@@ -173,6 +173,10 @@ def start_gpu(env: dict) -> bool:
     hf = ask_secret(env, "HF_TOKEN", "Hugging Face token (access to facebook/sam3 + facebook/sam-3d-objects): ",
                     required=True)
     blocked = hf_access(hf)
+    if blocked == ["facebook/sam-3d-objects"]:
+        say("no access to facebook/sam-3d-objects yet: using TRELLIS for the 3D models meanwhile")
+        say("  (the worker switches to SAM 3D by itself once access is granted and it's set up again)")
+        blocked = []
     if blocked:
         say("your Hugging Face token can't download: " + ", ".join(blocked))
         say("  1. on huggingface.co open each model page and request access (Meta approves by hand)")

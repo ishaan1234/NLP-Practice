@@ -68,10 +68,23 @@ def segmenter():
     return _models["sam3"]
 
 
+def load_3d():
+    """SAM 3D Objects when its (gated) weights are present, else TRELLIS as a stand-in."""
+    repo = Path(os.environ.get("SAM3D_REPO", "/content/sam-3d-objects"))
+    if (repo / "checkpoints" / "hf" / "pipeline.yaml").exists():
+        from app.reconstructors import Sam3DReconstructor
+        return Sam3DReconstructor()
+    from app.reconstructors import TrellisReconstructor
+    return TrellisReconstructor()
+
+
 @app.get("/health")
 def health(x_worker_token: str | None = Header(None)):
     check(x_worker_token)
     info = {"role": ROLE}
+    if ROLE == "sam3d":
+        repo = Path(os.environ.get("SAM3D_REPO", "/content/sam-3d-objects"))
+        info["model"] = "sam3d-objects" if (repo / "checkpoints" / "hf" / "pipeline.yaml").exists() else "trellis"
     if ROLE == "main":
         import requests
         try:
@@ -112,8 +125,7 @@ async def reconstruct(image: UploadFile = File(...), mask: UploadFile = File(...
     if m.shape != (img.height, img.width) or not m.any():
         raise HTTPException(422, "mask must match the image and select something")
     if "sam3d" not in _models:
-        from app.reconstructors import Sam3DReconstructor
-        _models["sam3d"] = Sam3DReconstructor()
+        _models["sam3d"] = load_3d()
     with gpu_lock, tempfile.TemporaryDirectory() as tmp:
         res = _models["sam3d"].reconstruct(img, m, Path(tmp) / "out")
         if res is None:

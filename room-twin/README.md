@@ -40,7 +40,7 @@ app to it and opens your browser. First run: a Google sign-in link to open and p
 
 Needs: Python 3.10+, Hugging Face access to the gated `facebook/sam3` and
 `facebook/sam-3d-objects` (request it on both model pages; the launcher checks before starting
-Colab), Colab compute units for the A100, and on Windows WSL (`wsl --install` once in an admin
+Colab - while SAM 3D access is pending, the 3D models come from Microsoft TRELLIS instead), Colab compute units for the A100, and on Windows WSL (`wsl --install` once in an admin
 PowerShell) because Google's Colab CLI runs on Linux/macOS only. Keys are kept in
 `room-twin/.roomtwin.env` (not committed).
 

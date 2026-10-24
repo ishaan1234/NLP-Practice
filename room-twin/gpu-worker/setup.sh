@@ -31,6 +31,8 @@ if [ ! -f checkpoints/hf/pipeline.yaml ]; then
   hf download --repo-type model --local-dir checkpoints/hf-download --max-workers 1 facebook/sam-3d-objects
   mv checkpoints/hf-download/checkpoints checkpoints/hf && rm -rf checkpoints/hf-download
 fi
+# no SAM 3D access (yet): TRELLIS as the 3D model meanwhile; the worker switches to SAM 3D once its weights exist
+[ -f checkpoints/hf/pipeline.yaml ] || bash "$(dirname "$(readlink -f "$0")")/trellis_setup.sh"
 micromamba deactivate
 cd /content
 # --- SAM 3 (Colab's own Python)
