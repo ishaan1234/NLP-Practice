@@ -20,6 +20,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -146,12 +147,36 @@ def worker_alive(url: str, token: str) -> bool:
         return False
 
 
+def hf_access(token: str) -> list[str]:
+    """Gated models this token can't download yet (checked in seconds, before a 30-min install)."""
+    blocked = []
+    for repo, f in (("facebook/sam-3d-objects", ".gitattributes"), ("facebook/sam3", "config.json")):
+        req = urllib.request.Request(f"https://huggingface.co/{repo}/resolve/main/{f}", method="HEAD",
+                                     headers={"Authorization": f"Bearer {token}"})
+        try:
+            urllib.request.urlopen(req, timeout=20)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                blocked.append(repo)
+        except Exception:
+            pass  # offline etc.: let the real install report it
+    return blocked
+
+
 def start_gpu(env: dict) -> bool:
     if worker_alive(env.get("ROOM_TWIN_GPU_URL", ""), env.get("ROOM_TWIN_GPU_TOKEN", "")):
         say(f"GPU worker already running at {env['ROOM_TWIN_GPU_URL']}")
         return True
     hf = ask_secret(env, "HF_TOKEN", "Hugging Face token (access to facebook/sam3 + facebook/sam-3d-objects): ",
                     required=True)
+    blocked = hf_access(hf)
+    if blocked:
+        say("your Hugging Face token can't download: " + ", ".join(blocked))
+        say("  1. on huggingface.co open each model page and request access (Meta approves by hand)")
+        say("  2. use a classic 'Read' token, or tick 'Read access to contents of all public gated repos")
+        say("     you can access' on a fine-grained one; then edit HF_TOKEN in .roomtwin.env")
+        say("starting without the GPU for now (photo cut-outs)")
+        return False
     ensure_colab_cli()
     colab_login()
     say("starting the GPU worker on Colab (first time: installs for 20-40 min; it says what it's doing)...")
