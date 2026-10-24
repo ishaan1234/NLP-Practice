@@ -29,29 +29,20 @@ cd roomroom/room-twin
 RoomTwin.bat                 # Windows: or double-click it.  macOS/Linux: python3 launch.py
 ```
 
-It sets everything up, asks once for a **fal.ai key** (real 3D models + SAM 3, see below) and
-optionally an **Anthropic key** (the AI assistant), then starts the app and opens your browser.
-Keys are kept in `room-twin/.roomtwin.env` (not committed). Needs Python 3.10+.
+It sets everything up, asks once for your **Hugging Face token** (and optionally an Anthropic key
+for the AI assistant), starts a **Google Colab A100** running SAM 3 + SAM 3D Objects, connects the
+app to it and opens your browser. First run: a Google sign-in link to open and paste back, then
+~30-40 min while Colab installs; later runs reuse the session while it is up.
 
-- `RoomTwin.bat status` - what's configured
-- `RoomTwin.bat --colab` - use your own Colab GPU instead of fal.ai (see `gpu-worker/`)
+- `RoomTwin.bat stop` - stop the Colab GPU (it uses compute units while it runs)
+- `RoomTwin.bat --no-gpu` - just the app, no GPU (photo cut-outs, CPU segmentation)
+- `RoomTwin.bat status` - what's configured and whether the GPU answers
 
-## Real 3D models: fal.ai
-
-Turning photos into real 3D models needs SAM 3D Objects on a big GPU. The app uses Meta's models
-hosted on **[fal.ai](https://fal.ai)**, so there is nothing to install and no GPU or gated
-download needed:
-
-| fal.ai endpoint | used for | price (Oct 2026) |
-|---|---|---|
-| `fal-ai/sam-3/3d-objects` | SAM 3D Objects: each detected object -> textured 3D mesh | $0.02 per object |
-| `fal-ai/sam-3/image` | SAM 3: find the furniture, floor, doors, windows | $0.005 per prompt per image |
-
-Create a key at fal.ai/dashboard/keys (add some credit) and set `FAL_KEY` - the launcher asks for
-it; on Vercel add it under Environment Variables. A room appears right away with photo cut-outs,
-then each object turns into a 3D model one by one (~$0.02 each). Segmenting with SAM 3 on fal costs
-about $0.12 per photo (23 prompts), so ~$0.90 for a 360 photo (8 views); to segment for free on
-your own CPU instead, `pip install torch transformers` and set `ROOM_TWIN_SEGMENTER=grounded-sam`.
+Needs: Python 3.10+, Hugging Face access to the gated `facebook/sam3` and
+`facebook/sam-3d-objects` (request it on both model pages; the launcher checks before starting
+Colab), Colab compute units for the A100, and on Windows WSL (`wsl --install` once in an admin
+PowerShell) because Google's Colab CLI runs on Linux/macOS only. Keys are kept in
+`room-twin/.roomtwin.env` (not committed).
 
 ## Quick start (manual)
 
@@ -94,12 +85,13 @@ export SAM3D_REPO=$PWD/sam-3d-objects          # where notebook/inference.py liv
 Models load lazily on the first build. If either fails to import, the server logs why and
 keeps going with the fallback.
 
-## Alternative: your own GPU (Colab or any box)
+## Real 3D models: SAM 3D Objects on a GPU
 
-Instead of fal.ai you can run SAM 3 + SAM 3D Objects yourself on a Linux machine with a >= 32 GB
-NVIDIA GPU, e.g. a Colab A100, with [`gpu-worker/`](gpu-worker/README.md) and set
-`ROOM_TWIN_GPU_URL` / `ROOM_TWIN_GPU_TOKEN` (`RoomTwin.bat --colab` does it for you). Needs
-Hugging Face access to the gated `facebook/sam3` and `facebook/sam-3d-objects` models.
+SAM 3D Objects needs a Linux machine with a >= 32 GB NVIDIA GPU, so the app runs it (and SAM 3)
+on a Colab A100 through [`gpu-worker/`](gpu-worker/README.md) - the launcher does this for you. The
+worker is reached over a private HTTPS tunnel via `ROOM_TWIN_GPU_URL` / `ROOM_TWIN_GPU_TOKEN`, so
+the app on your laptop or on Vercel uses it. A room appears right away with photo cut-outs, then
+each detected object turns into a real 3D mesh, one at a time.
 
 ## Deploy on Vercel
 

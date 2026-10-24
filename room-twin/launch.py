@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Room Twin launcher - one command on Windows, macOS or Linux.
 
-    python launch.py           set up, start the app, open the browser. Real 3D + SAM 3 come from
-                               fal.ai (asks once for a FAL_KEY; ~$0.02 per 3D object)
-    python launch.py --colab   use your own Colab GPU instead of fal.ai (needs Hugging Face access
-                               to the gated SAM models; on Windows also WSL)
+    python launch.py           set up, start a Colab GPU running SAM 3 + SAM 3D (real 3D models),
+                               start the app connected to it, open the browser
+    python launch.py --no-gpu  just the app, no Colab (photo cut-outs, CPU segmentation)
     python launch.py stop      stop the Colab GPU session (stops using compute units)
     python launch.py status    show what is configured
+
+Needs Hugging Face access to facebook/sam3 and facebook/sam-3d-objects, and on Windows WSL
+(`wsl --install` once), because Google's Colab CLI runs on Linux/macOS only.
 
 Settings live in .roomtwin.env (not committed).
 Only the Python standard library is used here.
@@ -201,11 +203,6 @@ def start_gpu(env: dict) -> bool:
 def up(colab: bool):
     env = load_env()
     ensure_venv()
-    if not colab:
-        fal = ask_secret(env, "FAL_KEY", "fal.ai API key for real 3D models + SAM 3 (fal.ai/dashboard/keys; "
-                         "Enter to skip): ", required=False)
-        if not fal:
-            say("no fal.ai key: detected objects stay photo cut-outs (add FAL_KEY to .roomtwin.env later)")
     ask_secret(env, "ANTHROPIC_API_KEY", "Anthropic API key for the AI assistant (Enter to skip): ", required=False)
     gpu = colab and start_gpu(env)
     app_env = {**os.environ, **{k: v for k, v in env.items() if v}}
@@ -236,7 +233,7 @@ def stop():
 def status():
     env = load_env()
     say(f"settings file: {ENV_FILE} ({'found' if ENV_FILE.exists() else 'not yet'})")
-    for key in ("FAL_KEY", "ANTHROPIC_API_KEY", "HF_TOKEN", "ROOM_TWIN_GPU_TOKEN"):
+    for key in ("HF_TOKEN", "ANTHROPIC_API_KEY", "ROOM_TWIN_GPU_TOKEN"):
         say(f"{key}: {'set' if env.get(key) else 'not set'}")
     url = env.get("ROOM_TWIN_GPU_URL", "")
     say(f"GPU worker: {url or 'none'} - {'answering' if worker_alive(url, env.get('ROOM_TWIN_GPU_TOKEN', '')) else 'not answering'}")
@@ -249,4 +246,4 @@ if __name__ == "__main__":
     elif "status" in args:
         status()
     else:
-        up(colab="--colab" in args)
+        up(colab="--no-gpu" not in args)
